@@ -1,0 +1,50 @@
+model:
+  name: gpt-oss-120b
+  num_layers: 36
+  hidden_size: 2880
+  num_q_heads: 64
+  num_kv_heads: 8
+  head_dim: 64
+  weight_bits: 4
+  num_weight_values: 16
+  num_experts: 128
+  top_k_experts: 4
+  vocab_size: 201088
+
+hnlpu:
+  num_chips: 16
+  chip_grid_rows: 4
+  chip_grid_cols: 4
+  stages_per_layer: 6
+  pipeline_slots: 216
+  max_batch_size: 216
+  clock_GHz: 1.0
+  vex_cached_kv_heads_per_cycle_per_chip: 32
+  reported_throughput_tokens_per_s_at_2k: 249960
+  calibration_context_length: 2048
+
+memory:
+  attention_buffer_mb_per_chip: 320
+  attention_buffer_banks_per_chip: 20000
+  attention_buffer_bank_kb: 16
+  attention_buffer_bandwidth_TBps_per_chip: 80
+  attention_buffer_latency_cycles: 3
+  hbm_capacity_GB_per_chip: 192
+  hbm_bandwidth_GBps_per_chip: 6400  # assumed: 论文给出每模块8个24GB HBM stack和HBM成本，未明确给出HBM带宽；这里按高端8-stack HBM3E量级估算。
+  kv_dtype_bytes: 2   # assumed: 论文未明确KV cache精度；这里按FP16/BF16 KV cache估算。
+
+interconnect:
+  cxl_bandwidth_GBps_per_link: 128
+  cxl_latency_ns: 100
+
+eval:
+  context_lengths:
+    start: 2048
+    stop: 524288
+    num: 64
+  attention_time_fraction_at_calibration: 0.25  # assumed: 论文Fig.14只给趋势图，未给2K处精确分解；短上下文以CXL/投影等固定项为主。
+  stall_hidden_until_context: 262144
+  exposed_hbm_stall_fraction_at_512k: 0.107
+  output_csv: hnlpu_performance_eval.csv
+  output_plot: hnlpu_performance_eval.png
+  memory_bandwidth_for_latency: hbm  # hbm or attention_buffer
