@@ -35,9 +35,10 @@ def throughput_eval(
     reported_throughput = parameters["hnlpu"]["reported_throughput_tokens_per_s_at_2k"]
     reported_time = batch_size / reported_throughput
     
-    calibration_attention_time = parameters["eval"]["attention_time_fraction_at_calibration"]
-    other_time = reported_time - reported_time * calibration_attention_time
-    attention_time = calibration_attention_time * (context_length / calibration_context_length)
+    calibration_attention_time_fraction = parameters["eval"]["attention_time_fraction_at_calibration"]
+    calibration_attention_time = reported_time * calibration_attention_time_fraction
+    other_time = reported_time - calibration_attention_time
+    attention_time = calibration_attention_time * (context_length / calibration_context_length) 
     
     additional_memory_stall = additional_memory_stall_eval(
         context_length, 
@@ -94,7 +95,7 @@ def plot_performance_vs_context_length(
     info = [
         ("kv cache size", "kv cache size (GB)"), 
         ("memory access latency", "memory access latency (ms)"), 
-        ("attention compute cost", "attention compute cost (ops/s)"), 
+        ("attention compute cost", "attention compute cost (ops)"), 
         ("throughput", "throughput (tokens/s)")
     ]
     
@@ -130,7 +131,7 @@ def main():
             parameters["memory"]["kv_dtype_bytes"], 
             parameters["hnlpu"]["max_batch_size"]
         )
-        performance["kv cache size"].append(kv_cache)
+        performance["kv cache size"].append(kv_cache / (1024 ** 3))
         
         attention_compute_cost = attention_compute_cost_eval(
             context_length, 
