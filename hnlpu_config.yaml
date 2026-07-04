@@ -42,7 +42,7 @@ eval:
     start: 2048
     stop: 524288
     num: 64
-  attention_time_fraction_at_calibration: 0.25  # assumed: 论文Fig.14只给趋势图，未给2K处精确分解；短上下文以CXL/投影等固定项为主。
+  attention_time_fraction_at_calibration: 0.0055  # assumed: 论文Fig.14只给趋势图，未给2K处精确分解；短上下文以CXL/投影等固定项为主。
   stall_hidden_until_context: 262144
   exposed_hbm_stall_fraction_at_512k: 0.107
   output_csv: hnlpu_performance_eval.csv
