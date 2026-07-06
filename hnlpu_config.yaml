@@ -22,6 +22,7 @@ hnlpu:
   vex_cached_kv_heads_per_cycle_per_chip: 32
   reported_throughput_tokens_per_s_at_2k: 249960
   calibration_context_length: 2048
+  calibration_batch_size: 216
 
 memory:
   attention_buffer_mb_per_chip: 320
@@ -46,5 +47,5 @@ eval:
   stall_hidden_until_context: 262144
   exposed_hbm_stall_fraction_at_512k: 0.107
   output_csv: hnlpu_performance_eval.csv
-  output_plot: hnlpu_performance_eval.png
+  output_plot: ./plots/hnlpu_performance_eval.png
   memory_bandwidth_for_latency: hbm  # hbm or attention_buffer

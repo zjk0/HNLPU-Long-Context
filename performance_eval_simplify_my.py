@@ -40,7 +40,7 @@ def throughput_eval(
 ):
     calibration_context_length = parameters["hnlpu"]["calibration_context_length"]
     reported_throughput = parameters["hnlpu"]["reported_throughput_tokens_per_s_at_2k"]
-    reported_time = batch_size / reported_throughput
+    reported_time = parameters["hnlpu"]["calibration_batch_size"] / reported_throughput
     
     calibration_attention_time_fraction = parameters["eval"]["attention_time_fraction_at_calibration"]
     calibration_attention_time = reported_time * calibration_attention_time_fraction
