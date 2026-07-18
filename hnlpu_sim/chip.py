@@ -1,4 +1,4 @@
-from memory import Memory
+from memory import AttentionBuffer, HBM
 from kv_cache import KVcacheBlock, KVcacheManager
 
 class Chip:
@@ -13,8 +13,8 @@ class Chip:
     ):
         self.row = row
         self.column = column
-        self.attention_buffer = Memory(attention_buffer_size_mb, attention_buffer_bandwidth_gb_per_s)
-        self.hbm = Memory(hbm_size_mb, hbm_bandwidth_gb_per_s)
+        self.attention_buffer = AttentionBuffer(attention_buffer_size_mb, attention_buffer_bandwidth_gb_per_s)
+        self.hbm = HBM(hbm_size_mb, hbm_bandwidth_gb_per_s)
         self.current_tasks = []
         
     def get_current_tasks(self):
