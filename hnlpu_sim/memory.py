@@ -108,9 +108,74 @@ class Memory:
         return self.fixed_access_latency_s + access_size_byte / self.bandwidth_byte_per_s
         
 class AttentionBuffer(Memory):
-    def __init__(self, size_byte, bandwidth_byte_per_s, fixed_access_latency_s):
-        super.__init__(size_byte, bandwidth_byte_per_s, fixed_access_latency_s)
+    def __init__(
+        self,
+        num_banks = 20000,
+        bank_size_byte = 16000,
+        read_ports_per_bank = 1,
+        write_ports_per_bank = 1,
+        access_width_bit = 32,
+        access_latency_cycles = 3,
+        clock_frequency_hz = 1000000000,
+    ):
+        self._validate_integer(num_banks, "num_banks", minimum = 1)
+        self._validate_integer(bank_size_byte, "bank_size_byte", minimum = 1)
+        self._validate_integer(read_ports_per_bank, "read_ports_per_bank", minimum = 1)
+        self._validate_integer(write_ports_per_bank, "write_ports_per_bank", minimum = 1)
+        self._validate_integer(access_width_bit, "access_width_bit", minimum = 1)
+        self._validate_integer(access_latency_cycles, "access_latency_cycles", minimum = 0)
+        self._validate_number(
+            clock_frequency_hz,
+            "clock_frequency_hz",
+            minimum = 0,
+            inclusive = False,
+        )
+        if access_width_bit % 8 != 0:
+            raise ValueError("access_width_bit must be divisible by 8.")
+
+        size_byte = num_banks * bank_size_byte
+        access_width_byte = access_width_bit // 8
+        bandwidth_byte_per_s = (
+            num_banks
+            * read_ports_per_bank
+            * access_width_byte
+            * clock_frequency_hz
+        )
+        fixed_access_latency_s = access_latency_cycles / clock_frequency_hz
+
+        super().__init__(size_byte, bandwidth_byte_per_s, fixed_access_latency_s)
+
+        self.num_banks = num_banks
+        self.bank_size_byte = bank_size_byte
+        self.read_ports_per_bank = read_ports_per_bank
+        self.write_ports_per_bank = write_ports_per_bank
+        self.access_width_bit = access_width_bit
+        self.access_width_byte = access_width_byte
+        self.access_latency_cycles = access_latency_cycles
+        self.clock_frequency_hz = clock_frequency_hz
+        
+    def read(self):
+        pass
+    
+    def write(self):
+        pass
     
 class HBM(Memory):
-    def __init__(self):
-        pass
+    def __init__(
+        self,
+        num_stacks = 8,
+        stack_size_byte = 24000000000,
+        bandwidth_byte_per_s = 6400000000000,
+        fixed_access_latency_s = 100e-9,
+    ):
+        self._validate_integer(num_stacks, "num_stacks", minimum = 1)
+        self._validate_integer(stack_size_byte, "stack_size_byte", minimum = 1)
+
+        size_byte = num_stacks * stack_size_byte
+
+        # The paper specifies HBM capacity but not bandwidth or access latency.
+        # The default bandwidth (6.4 TB/s) and latency (100 ns) are assumptions.
+        super().__init__(size_byte, bandwidth_byte_per_s, fixed_access_latency_s)
+
+        self.num_stacks = num_stacks
+        self.stack_size_byte = stack_size_byte
