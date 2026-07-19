@@ -66,6 +66,7 @@ class Memory:
             return False
         
     def allocate_memory(self, allocate_size_byte, allocate_id):
+        self._ensure_consistent()
         self._validate_integer(allocate_size_byte, "allocate_size_byte", minimum = 1)
         self._validate_allocation_id(allocate_id, "allocate_id")
         
@@ -78,11 +79,11 @@ class Memory:
         
         self._usage_byte += allocate_size_byte
         self._allocate_info[allocate_id] = allocate_size_byte
-        if not self.check_consistency():
-            raise RuntimeError("Memory allocation state is inconsistent.")
+        self._ensure_consistent()
         return True
         
     def free_memory(self, free_id):
+        self._ensure_consistent()
         self._validate_allocation_id(free_id, "free_id")
 
         # The ID to free must exist
@@ -91,13 +92,16 @@ class Memory:
         
         free_size = self._allocate_info.pop(free_id)
         self._usage_byte -= free_size
-        if not self.check_consistency():
-            raise RuntimeError("Memory allocation state is inconsistent.")
+        self._ensure_consistent()
         return True
 
     def check_consistency(self):
         allocated_size = sum(self._allocate_info.values())
         return 0 <= self.usage_byte <= self.size_byte and self.usage_byte == allocated_size
+
+    def _ensure_consistent(self):
+        if not self.check_consistency():
+            raise RuntimeError("Memory allocation state is inconsistent.")
 
     def calculate_access_time_s(self, access_size_byte):
         self._validate_integer(access_size_byte, "access_size_byte", minimum = 0)
