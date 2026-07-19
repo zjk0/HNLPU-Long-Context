@@ -47,7 +47,7 @@ class Memory:
     def get_usage(self):
         return self.usage_byte
     
-    def get_remain_size(self):
+    def get_remaining_size(self):
         return self.size_byte - self.usage_byte
 
     def get_usage_ratio(self):
@@ -66,7 +66,7 @@ class Memory:
             return False
         
     def allocate_memory(self, allocate_size_byte, allocate_id):
-        self._validate_integer(allocate_size_byte, "allocate_size_byte", minimum=1)
+        self._validate_integer(allocate_size_byte, "allocate_size_byte", minimum = 1)
         self._validate_allocation_id(allocate_id, "allocate_id")
         
         # Allocate ID can not repeat.
@@ -100,8 +100,7 @@ class Memory:
         return 0 <= self.usage_byte <= self.size_byte and self.usage_byte == allocated_size
 
     def calculate_access_time_s(self, access_size_byte):
-        self._validate_integer(access_size_byte, "access_size_byte", minimum=0)
-
+        self._validate_integer(access_size_byte, "access_size_byte", minimum = 0)
         return self.fixed_access_latency_s + access_size_byte / self.bandwidth_byte_per_s
         
 class AttentionBuffer(Memory):
