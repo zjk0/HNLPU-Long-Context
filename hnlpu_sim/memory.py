@@ -45,22 +45,22 @@ class Memory:
             raise TypeError(f"{name} must be hashable.") from exc
     
     def get_usage(self):
-        return self.usage_byte
+        return self._usage_byte
     
     def get_remaining_size(self):
-        return self.size_byte - self.usage_byte
+        return self.size_byte - self._usage_byte
 
     def get_usage_ratio(self):
-        return self.usage_byte / self.size_byte
+        return self._usage_byte / self.size_byte
         
     def is_full(self):
-        if self.usage_byte >= self.size_byte:
+        if self._usage_byte >= self.size_byte:
             return True
         else:
             return False
         
     def is_empty(self):
-        if self.usage_byte == 0:
+        if self._usage_byte == 0:
             return True
         else:
             return False
@@ -74,7 +74,7 @@ class Memory:
         if allocate_id in self._allocate_info:
             raise ValueError(f"allocate_id({allocate_id}) has already existed.")
         
-        if self.usage_byte + allocate_size_byte > self.size_byte:
+        if self._usage_byte + allocate_size_byte > self.size_byte:
             return False
         
         self._usage_byte += allocate_size_byte
@@ -97,7 +97,7 @@ class Memory:
 
     def check_consistency(self):
         allocated_size = sum(self._allocate_info.values())
-        return 0 <= self.usage_byte <= self.size_byte and self.usage_byte == allocated_size
+        return 0 <= self._usage_byte <= self.size_byte and self._usage_byte == allocated_size
 
     def _ensure_consistent(self):
         if not self.check_consistency():
@@ -112,6 +112,7 @@ class AttentionBuffer(Memory):
         self,
         num_banks = 20000,
         bank_size_byte = 16000,
+        banks_per_group = 32,
         read_ports_per_bank = 1,
         write_ports_per_bank = 1,
         access_width_bit = 32,
@@ -120,6 +121,7 @@ class AttentionBuffer(Memory):
     ):
         self._validate_integer(num_banks, "num_banks", minimum = 1)
         self._validate_integer(bank_size_byte, "bank_size_byte", minimum = 1)
+        self._validate_integer(banks_per_group, "banks_per_group", minimum = 1)
         self._validate_integer(read_ports_per_bank, "read_ports_per_bank", minimum = 1)
         self._validate_integer(write_ports_per_bank, "write_ports_per_bank", minimum = 1)
         self._validate_integer(access_width_bit, "access_width_bit", minimum = 1)
@@ -132,8 +134,14 @@ class AttentionBuffer(Memory):
         )
         if access_width_bit % 8 != 0:
             raise ValueError("access_width_bit must be divisible by 8.")
+        if banks_per_group > num_banks:
+            raise ValueError("banks_per_group must not be greater than num_banks.")
+        if num_banks % banks_per_group != 0:
+            raise ValueError("num_banks must be divisible by banks_per_group.")
 
         size_byte = num_banks * bank_size_byte
+        num_bank_groups = num_banks // banks_per_group
+        bank_group_size_byte = banks_per_group * bank_size_byte
         access_width_byte = access_width_bit // 8
         bandwidth_byte_per_s = (
             num_banks
@@ -147,13 +155,46 @@ class AttentionBuffer(Memory):
 
         self.num_banks = num_banks
         self.bank_size_byte = bank_size_byte
+        self.banks_per_group = banks_per_group
+        self.num_bank_groups = num_bank_groups
+        self.bank_group_size_byte = bank_group_size_byte
         self.read_ports_per_bank = read_ports_per_bank
         self.write_ports_per_bank = write_ports_per_bank
         self.access_width_bit = access_width_bit
         self.access_width_byte = access_width_byte
         self.access_latency_cycles = access_latency_cycles
         self.clock_frequency_hz = clock_frequency_hz
+
+        self._bank_usage_byte = [0] * num_banks
+        self._bank_read_busy_until_cycle = [
+            [0] * read_ports_per_bank for _ in range(num_banks)
+        ]
+        self._bank_write_busy_until_cycle = [
+            [0] * write_ports_per_bank for _ in range(num_banks)
+        ]
         
+    def check_consistency(self):
+        allocated_size = 0
+        for id in self._allocate_info.keys():
+            allocated_size += sum(self._allocate_info[id].values())
+        return 0 <= self._usage_byte <= self.size_byte and self._usage_byte == allocated_size
+    
+    def allocate_memory(self, allocate_size_byte, allocate_id):
+        self._ensure_consistent()
+        self._validate_integer(allocate_size_byte, "allocate_size_byte", minimum = 1)
+        self._validate_allocation_id(allocate_id, "allocate_id")
+        
+        if allocate_id in self._allocate_info:
+            raise ValueError(f"allocate_id({allocate_id}) has already existed.")
+        
+        if self._usage_byte + allocate_size_byte > self.size_byte:
+            return False
+        
+        self._allocate_info[allocate_id] = {}
+        
+        
+        self._usage_byte += allocate_size_byte
+    
     def read(self):
         pass
     
