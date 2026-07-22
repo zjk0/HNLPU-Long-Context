@@ -7,16 +7,8 @@ class Memory:
         self.size_byte = size_byte
         self.bandwidth_byte_per_s = bandwidth_byte_per_s
         self.fixed_access_latency_s = fixed_access_latency_s
-        self._usage_byte = 0
-        self._allocate_info = {}
-
-    @property
-    def usage_byte(self):
-        return self._usage_byte
-
-    @property
-    def allocate_info(self):
-        return self._allocate_info.copy()
+        self.usage_byte = 0
+        self.allocate_info = {}
 
     @staticmethod
     def _validate_integer(value, name, minimum = 0):
@@ -45,61 +37,61 @@ class Memory:
             raise TypeError(f"{name} must be hashable.") from exc
     
     def get_usage(self):
-        return self._usage_byte
+        return self.usage_byte
     
     def get_remaining_size(self):
-        return self.size_byte - self._usage_byte
+        return self.size_byte - self.usage_byte
 
     def get_usage_ratio(self):
-        return self._usage_byte / self.size_byte
+        return self.usage_byte / self.size_byte
         
     def is_full(self):
-        if self._usage_byte >= self.size_byte:
+        if self.usage_byte >= self.size_byte:
             return True
         else:
             return False
         
     def is_empty(self):
-        if self._usage_byte == 0:
+        if self.usage_byte == 0:
             return True
         else:
             return False
         
     def allocate_memory(self, allocate_size_byte, allocate_id):
-        self._ensure_consistent()
+        self.ensure_consistent()
         self._validate_integer(allocate_size_byte, "allocate_size_byte", minimum = 1)
         self._validate_allocation_id(allocate_id, "allocate_id")
         
         # Allocate ID can not repeat.
-        if allocate_id in self._allocate_info:
+        if allocate_id in self.allocate_info:
             raise ValueError(f"allocate_id({allocate_id}) has already existed.")
         
-        if self._usage_byte + allocate_size_byte > self.size_byte:
+        if self.usage_byte + allocate_size_byte > self.size_byte:
             return False
         
-        self._usage_byte += allocate_size_byte
-        self._allocate_info[allocate_id] = allocate_size_byte
-        self._ensure_consistent()
+        self.usage_byte += allocate_size_byte
+        self.allocate_info[allocate_id] = allocate_size_byte
+        self.ensure_consistent()
         return True
         
     def free_memory(self, free_id):
-        self._ensure_consistent()
+        self.ensure_consistent()
         self._validate_allocation_id(free_id, "free_id")
 
         # The ID to free must exist
-        if free_id not in self._allocate_info:
+        if free_id not in self.allocate_info:
             raise ValueError(f"free_id({free_id}) does not exist.")
         
-        free_size = self._allocate_info.pop(free_id)
-        self._usage_byte -= free_size
-        self._ensure_consistent()
+        free_size = self.allocate_info.pop(free_id)
+        self.usage_byte -= free_size
+        self.ensure_consistent()
         return True
 
     def check_consistency(self):
-        allocated_size = sum(self._allocate_info.values())
-        return 0 <= self._usage_byte <= self.size_byte and self._usage_byte == allocated_size
+        allocated_size = sum(self.allocate_info.values())
+        return 0 <= self.usage_byte <= self.size_byte and self.usage_byte == allocated_size
 
-    def _ensure_consistent(self):
+    def ensure_consistent(self):
         if not self.check_consistency():
             raise RuntimeError("Memory allocation state is inconsistent.")
 
@@ -165,35 +157,106 @@ class AttentionBuffer(Memory):
         self.access_latency_cycles = access_latency_cycles
         self.clock_frequency_hz = clock_frequency_hz
 
-        self._bank_usage_byte = [0] * num_banks
-        self._bank_read_busy_until_cycle = [
+        self.next_bank_group_id = 0
+        self.bank_group_usage_byte = [0] * num_bank_groups
+        self.bank_usage_byte = [0] * num_banks
+        self.bank_read_busy_until_cycle = [
             [0] * read_ports_per_bank for _ in range(num_banks)
         ]
-        self._bank_write_busy_until_cycle = [
+        self.bank_write_busy_until_cycle = [
             [0] * write_ports_per_bank for _ in range(num_banks)
         ]
         
     def check_consistency(self):
+        if any(
+            not 0 <= usage <= self.bank_size_byte
+            for usage in self.bank_usage_byte
+        ):
+            return False
+        if any(
+            not 0 <= usage <= self.bank_group_size_byte
+            for usage in self.bank_group_usage_byte
+        ):
+            return False
+
+        allocated_by_bank = [0] * self.num_banks
+        allocated_by_group = [0] * self.num_bank_groups
         allocated_size = 0
-        for id in self._allocate_info.keys():
-            allocated_size += sum(self._allocate_info[id].values())
-        return 0 <= self._usage_byte <= self.size_byte and self._usage_byte == allocated_size
+
+        for allocation in self.allocate_info.values():
+            if not all(key in allocation for key in ("size", "bank_group", "bank")):
+                return False
+
+            allocation_size = allocation["size"]
+            bank_group_id = allocation["bank_group"]
+            bank_allocations = allocation["bank"]
+
+            if allocation_size <= 0:
+                return False
+            if not 0 <= bank_group_id < self.num_bank_groups:
+                return False
+            if not bank_allocations:
+                return False
+
+            first_bank_id = bank_group_id * self.banks_per_group
+            last_bank_id = first_bank_id + self.banks_per_group
+            allocation_size_from_banks = 0
+
+            for bank_id, allocated_size_byte in bank_allocations.items():
+                if not first_bank_id <= bank_id < last_bank_id:
+                    return False
+                if allocated_size_byte <= 0:
+                    return False
+
+                allocated_by_bank[bank_id] += allocated_size_byte
+                allocation_size_from_banks += allocated_size_byte
+
+            if allocation_size != allocation_size_from_banks:
+                return False
+
+            allocated_by_group[bank_group_id] += allocation_size
+            allocated_size += allocation_size
+
+        if allocated_by_bank != self.bank_usage_byte:
+            return False
+        if allocated_by_group != self.bank_group_usage_byte:
+            return False
+
+        for bank_group_id, group_usage_byte in enumerate(self.bank_group_usage_byte):
+            first_bank_id = bank_group_id * self.banks_per_group
+            last_bank_id = first_bank_id + self.banks_per_group
+            if group_usage_byte != sum(self.bank_usage_byte[first_bank_id:last_bank_id]):
+                return False
+
+        return (
+            0 <= self.usage_byte <= self.size_byte
+            and self.usage_byte == allocated_size
+            and self.usage_byte == sum(allocated_by_bank)
+            and self.usage_byte == sum(allocated_by_group)
+        )
     
     def allocate_memory(self, allocate_size_byte, allocate_id):
-        self._ensure_consistent()
+        self.ensure_consistent()
         self._validate_integer(allocate_size_byte, "allocate_size_byte", minimum = 1)
         self._validate_allocation_id(allocate_id, "allocate_id")
         
-        if allocate_id in self._allocate_info:
+        if allocate_id in self.allocate_info:
             raise ValueError(f"allocate_id({allocate_id}) has already existed.")
         
-        if self._usage_byte + allocate_size_byte > self.size_byte:
+        if self.usage_byte + allocate_size_byte > self.size_byte:
             return False
         
-        self._allocate_info[allocate_id] = {}
+        self.allocate_info[allocate_id] = {}
+        
+        self.allocate_info[allocate_id]["size"] = allocate_size_byte
+        self.usage_byte += allocate_size_byte
+        
+        self.allocate_info[allocate_id]["bank_group"] = self.next_bank_group_id
+        self.bank_group_usage_byte[self.next_bank_group_id] += allocate_size_byte
+        self.next_bank_group_id = (self.next_bank_group_id + 1) % self.num_bank_groups
         
         
-        self._usage_byte += allocate_size_byte
+        
     
     def read(self):
         pass
