@@ -1,3 +1,5 @@
+import numpy as np
+
 class Memory:
     def __init__(self, size_byte, bandwidth_byte_per_s, fixed_access_latency_s):
         self._validate_integer(size_byte, "size_byte", minimum = 1)
@@ -158,8 +160,9 @@ class AttentionBuffer(Memory):
         self.clock_frequency_hz = clock_frequency_hz
 
         self.next_bank_group_id = 0
+        self.next_bank_group_offset = [0] * num_bank_groups
         self.bank_group_usage_byte = [0] * num_bank_groups
-        self.bank_usage_byte = [0] * num_banks
+        self.bank_usage_byte = np.zeros(num_banks, dtype=np.int64)
         self.bank_read_busy_until_cycle = [
             [0] * read_ports_per_bank for _ in range(num_banks)
         ]
@@ -168,9 +171,9 @@ class AttentionBuffer(Memory):
         ]
         
     def check_consistency(self):
-        if any(
-            not 0 <= usage <= self.bank_size_byte
-            for usage in self.bank_usage_byte
+        if np.any(
+            (self.bank_usage_byte < 0)
+            | (self.bank_usage_byte > self.bank_size_byte)
         ):
             return False
         if any(
@@ -179,7 +182,7 @@ class AttentionBuffer(Memory):
         ):
             return False
 
-        allocated_by_bank = [0] * self.num_banks
+        allocated_by_bank = np.zeros(self.num_banks, dtype=np.int64)
         allocated_by_group = [0] * self.num_bank_groups
         allocated_size = 0
 
@@ -217,7 +220,7 @@ class AttentionBuffer(Memory):
             allocated_by_group[bank_group_id] += allocation_size
             allocated_size += allocation_size
 
-        if allocated_by_bank != self.bank_usage_byte:
+        if not np.array_equal(allocated_by_bank, self.bank_usage_byte):
             return False
         if allocated_by_group != self.bank_group_usage_byte:
             return False
@@ -225,13 +228,15 @@ class AttentionBuffer(Memory):
         for bank_group_id, group_usage_byte in enumerate(self.bank_group_usage_byte):
             first_bank_id = bank_group_id * self.banks_per_group
             last_bank_id = first_bank_id + self.banks_per_group
-            if group_usage_byte != sum(self.bank_usage_byte[first_bank_id:last_bank_id]):
+            if group_usage_byte != np.sum(
+                self.bank_usage_byte[first_bank_id:last_bank_id]
+            ):
                 return False
 
         return (
             0 <= self.usage_byte <= self.size_byte
             and self.usage_byte == allocated_size
-            and self.usage_byte == sum(allocated_by_bank)
+            and self.usage_byte == np.sum(allocated_by_bank)
             and self.usage_byte == sum(allocated_by_group)
         )
     
@@ -245,6 +250,20 @@ class AttentionBuffer(Memory):
         
         if self.usage_byte + allocate_size_byte > self.size_byte:
             return False
+        if self.bank_group_usage_byte[self.next_bank_group_id] + allocate_size_byte > self.bank_group_size_byte:
+            return False
+        # Assume that allocate_size_byte % 4 == 0
+        allocate_bank_num = allocate_size_byte / self.access_width_byte
+        base_num_per_bank = allocate_bank_num // self.banks_per_group
+        additional_num = allocate_bank_num % self.banks_per_group
+        group_start_id = self.next_bank_group_id * self.banks_per_group
+        group_end_id = ((self.next_bank_group_id + 1) % self.num_bank_groups) * self.banks_per_group - 1
+        if not np.all(self.bank_usage_byte[group_start_id: group_end_id + 1] + self.access_width_byte * base_num_per_bank <= self.bank_size_byte):
+            return False
+        for i in range(additional_num):
+            offset = (self.next_bank_group_offset[self.next_bank_group_id] + i) % self.banks_per_group
+            if self.bank_usage_byte[group_start_id + offset] + self.access_width_byte * base_num_per_bank + self.access_width_byte > self.bank_size_byte:
+                return False
         
         self.allocate_info[allocate_id] = {}
         
@@ -253,10 +272,22 @@ class AttentionBuffer(Memory):
         
         self.allocate_info[allocate_id]["bank_group"] = self.next_bank_group_id
         self.bank_group_usage_byte[self.next_bank_group_id] += allocate_size_byte
+        
+        self.allocate_info[allocate_id]["bank"] = {}
+        self.bank_usage_byte[group_start_id: group_end_id + 1] += self.access_width_byte * base_num_per_bank
+        for i in range(additional_num):
+            offset = (self.next_bank_group_offset[self.next_bank_group_id] + i) % self.banks_per_group
+            self.allocate_info[allocate_id]["bank"][group_start_id + offset] = self.access_width_byte
+            self.bank_usage_byte[group_start_id + offset] += self.access_width_byte
+        if base_num_per_bank > 0:
+            for i in range(self.banks_per_group):
+                if (group_start_id + i) in self.allocate_info[allocate_id]["bank"].keys():
+                    self.allocate_info[allocate_id]["bank"][group_start_id + i] += self.access_width_byte * base_num_per_bank
+                else:
+                    self.allocate_info[allocate_id]["bank"][group_start_id + i] = self.access_width_byte * base_num_per_bank
+        
+        self.next_bank_group_offset[self.next_bank_group_id] = (self.next_bank_group_offset[self.next_bank_group_id] + additional_num) % self.banks_per_group
         self.next_bank_group_id = (self.next_bank_group_id + 1) % self.num_bank_groups
-        
-        
-        
     
     def read(self):
         pass
