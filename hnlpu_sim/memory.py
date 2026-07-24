@@ -250,44 +250,61 @@ class AttentionBuffer(Memory):
         
         if self.usage_byte + allocate_size_byte > self.size_byte:
             return False
-        if self.bank_group_usage_byte[self.next_bank_group_id] + allocate_size_byte > self.bank_group_size_byte:
-            return False
-        # Assume that allocate_size_byte % 4 == 0
-        allocate_bank_num = allocate_size_byte / self.access_width_byte
+        
+        is_over_bank_groups = True
+        is_over_banks_in_group = True
+        temp_next_bank_group_id = self.next_bank_group_id
+        allocate_bank_num = allocate_size_byte // self.access_width_byte  # Assume that allocate_size_byte % 4 == 0
         base_num_per_bank = allocate_bank_num // self.banks_per_group
         additional_num = allocate_bank_num % self.banks_per_group
-        group_start_id = self.next_bank_group_id * self.banks_per_group
-        group_end_id = ((self.next_bank_group_id + 1) % self.num_bank_groups) * self.banks_per_group - 1
-        if not np.all(self.bank_usage_byte[group_start_id: group_end_id + 1] + self.access_width_byte * base_num_per_bank <= self.bank_size_byte):
+        for i in range(self.num_bank_groups):
+            group_id = (temp_next_bank_group_id + i) % self.num_bank_groups
+            is_over_bank_groups = True
+            if self.bank_group_usage_byte[group_id] + allocate_size_byte <= self.bank_group_size_byte:
+                is_over_bank_groups = False
+                group_start_id = group_id * self.banks_per_group
+                group_end_id = ((group_id + 1) % self.num_bank_groups) * self.banks_per_group - 1 if (group_id + 1) % self.num_bank_groups != 0 else group_start_id + self.banks_per_group - 1
+                if not np.all(self.bank_usage_byte[group_start_id: group_end_id + 1] + self.access_width_byte * base_num_per_bank <= self.bank_size_byte):
+                    continue
+                is_additional_num_ok = True
+                for i in range(additional_num):
+                    offset = (self.next_bank_group_offset[group_id] + i) % self.banks_per_group
+                    if self.bank_usage_byte[group_start_id + offset] + self.access_width_byte * base_num_per_bank + self.access_width_byte > self.bank_size_byte:
+                        is_additional_num_ok = False
+                        break
+                if is_additional_num_ok:
+                    is_over_banks_in_group = False
+                    break
+        if is_over_bank_groups or is_over_banks_in_group:
             return False
-        for i in range(additional_num):
-            offset = (self.next_bank_group_offset[self.next_bank_group_id] + i) % self.banks_per_group
-            if self.bank_usage_byte[group_start_id + offset] + self.access_width_byte * base_num_per_bank + self.access_width_byte > self.bank_size_byte:
-                return False
+        self.next_bank_group_id = group_id
         
-        self.allocate_info[allocate_id] = {}
+        temp_allocate_info = {}
         
-        self.allocate_info[allocate_id]["size"] = allocate_size_byte
         self.usage_byte += allocate_size_byte
+        temp_allocate_info["size"] = allocate_size_byte
         
-        self.allocate_info[allocate_id]["bank_group"] = self.next_bank_group_id
         self.bank_group_usage_byte[self.next_bank_group_id] += allocate_size_byte
+        temp_allocate_info["bank_group"] = self.next_bank_group_id
         
-        self.allocate_info[allocate_id]["bank"] = {}
+        temp_allocate_info["bank"] = {}
         self.bank_usage_byte[group_start_id: group_end_id + 1] += self.access_width_byte * base_num_per_bank
         for i in range(additional_num):
             offset = (self.next_bank_group_offset[self.next_bank_group_id] + i) % self.banks_per_group
-            self.allocate_info[allocate_id]["bank"][group_start_id + offset] = self.access_width_byte
             self.bank_usage_byte[group_start_id + offset] += self.access_width_byte
+            temp_allocate_info["bank"][group_start_id + offset] = self.access_width_byte
         if base_num_per_bank > 0:
             for i in range(self.banks_per_group):
-                if (group_start_id + i) in self.allocate_info[allocate_id]["bank"].keys():
-                    self.allocate_info[allocate_id]["bank"][group_start_id + i] += self.access_width_byte * base_num_per_bank
+                if (group_start_id + i) in temp_allocate_info["bank"].keys():
+                    temp_allocate_info["bank"][group_start_id + i] += self.access_width_byte * base_num_per_bank
                 else:
-                    self.allocate_info[allocate_id]["bank"][group_start_id + i] = self.access_width_byte * base_num_per_bank
+                    temp_allocate_info["bank"][group_start_id + i] = self.access_width_byte * base_num_per_bank
         
+        self.allocate_info[allocate_id] = temp_allocate_info
         self.next_bank_group_offset[self.next_bank_group_id] = (self.next_bank_group_offset[self.next_bank_group_id] + additional_num) % self.banks_per_group
         self.next_bank_group_id = (self.next_bank_group_id + 1) % self.num_bank_groups
+        self.ensure_consistent()
+        return True
     
     def read(self):
         pass
