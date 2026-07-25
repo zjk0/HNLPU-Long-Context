@@ -334,6 +334,23 @@ class AttentionBuffer(Memory):
         self.ensure_consistent()
         return True
     
+    def free_memory(self, free_id):
+        self.ensure_consistent()
+        self._validate_allocation_id(free_id, "free_id")
+
+        # The ID to free must exist
+        if free_id not in self.allocate_info:
+            raise ValueError(f"free_id({free_id}) does not exist.")
+        
+        self.usage_byte -= self.allocate_info[free_id]["size"]
+        self.bank_group_usage_byte[self.allocate_info[free_id]["bank_group"]] -= self.allocate_info[free_id]["size"]
+        for bank_id in self.allocate_info[free_id]["bank"].keys():
+            self.bank_usage_byte[bank_id] -= self.allocate_info[free_id]["bank"][bank_id]
+            
+        self.allocate_info.pop(free_id)
+        self.ensure_consistent()
+        return True
+    
     def read(self):
         pass
     
