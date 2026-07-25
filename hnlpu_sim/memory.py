@@ -351,8 +351,93 @@ class AttentionBuffer(Memory):
         self.ensure_consistent()
         return True
     
-    def read(self):
-        pass
+    def read(self, allocate_ids, request_cycle):
+        # Validate the memory state and request parameters.
+        self.ensure_consistent()
+        if not isinstance(allocate_ids, list):
+            raise TypeError("allocate_ids must be a list.")
+        if not allocate_ids:
+            raise ValueError("allocate_ids must not be empty.")
+        self._validate_integer(request_cycle, "request_cycle", minimum = 0)
+
+        # Validate IDs, reject duplicates, and merge accesses to the same bank.
+        seen_allocate_ids = set()
+        bank_read_size = {}
+        data_ready_cycle = request_cycle
+
+        for allocate_id in allocate_ids:
+            self._validate_allocation_id(allocate_id, "allocate_id")
+            if allocate_id in seen_allocate_ids:
+                raise ValueError(
+                    f"allocate_id({allocate_id}) is duplicated in allocate_ids."
+                )
+            if allocate_id not in self.allocate_info:
+                raise ValueError(f"allocate_id({allocate_id}) does not exist.")
+
+            seen_allocate_ids.add(allocate_id)
+            allocation = self.allocate_info[allocate_id]
+
+            # An allocation cannot be read before its write has completed.
+            if "ready_cycle" not in allocation:
+                raise RuntimeError(
+                    f"allocate_id({allocate_id}) has not been written."
+                )
+            ready_cycle = allocation["ready_cycle"]
+            self._validate_integer(
+                ready_cycle,
+                f"ready_cycle of allocate_id({allocate_id})",
+                minimum = 0,
+            )
+            data_ready_cycle = max(data_ready_cycle, ready_cycle)
+
+            for bank_id, read_size_byte in allocation["bank"].items():
+                bank_read_size[bank_id] = (
+                    bank_read_size.get(bank_id, 0) + read_size_byte
+                )
+
+        # Select the earliest available read port for every involved bank.
+        selected_read_port = {}
+        port_ready_cycle = request_cycle
+
+        for bank_id in bank_read_size:
+            read_port_id = min(
+                range(self.read_ports_per_bank),
+                key = lambda port_id: self.bank_read_busy_until_cycle[bank_id][port_id],
+            )
+            selected_read_port[bank_id] = read_port_id
+            port_ready_cycle = max(
+                port_ready_cycle,
+                self.bank_read_busy_until_cycle[bank_id][read_port_id],
+            )
+
+        # Start all bank reads together after both data and ports are ready.
+        start_cycle = max(request_cycle, data_ready_cycle, port_ready_cycle)
+        wait_cycles = start_cycle - request_cycle
+        finish_cycle = start_cycle
+
+        # Issue one access-width unit per cycle on each selected read port.
+        for bank_id, read_size_byte in bank_read_size.items():
+            issue_cycles = (read_size_byte + self.access_width_byte - 1) // self.access_width_byte
+            read_port_id = selected_read_port[bank_id]
+
+            self.bank_read_busy_until_cycle[bank_id][read_port_id] = start_cycle + issue_cycles
+            bank_finish_cycle = start_cycle + issue_cycles - 1 + self.access_latency_cycles
+            finish_cycle = max(finish_cycle, bank_finish_cycle)
+
+        service_cycles = finish_cycle - start_cycle
+        total_latency_cycles = finish_cycle - request_cycle
+
+        # Return timing information and the merged per-bank read workload.
+        return {
+            "request_cycle": request_cycle,
+            "start_cycle": start_cycle,
+            "finish_cycle": finish_cycle,
+            "wait_cycles": wait_cycles,
+            "service_cycles": service_cycles,
+            "total_latency_cycles": total_latency_cycles,
+            "total_read_size_byte": sum(bank_read_size.values()),
+            "bank_read_size": bank_read_size,
+        }
     
     def write(self):
         pass
