@@ -439,8 +439,70 @@ class AttentionBuffer(Memory):
             "bank_read_size": bank_read_size,
         }
     
-    def write(self):
-        pass
+    def write(self, allocate_id, request_cycle):
+        # Validate the memory state and request parameters.
+        self.ensure_consistent()
+        self._validate_allocation_id(allocate_id, "allocate_id")
+        self._validate_integer(request_cycle, "request_cycle", minimum=0)
+
+        if allocate_id not in self.allocate_info:
+            raise ValueError(f"allocate_id({allocate_id}) does not exist.")
+
+        allocation = self.allocate_info[allocate_id]
+        if "ready_cycle" in allocation:
+            raise RuntimeError(
+                f"allocate_id({allocate_id}) has already been written."
+            )
+
+        # Get the per-bank write workload from the allocation record.
+        bank_write_size = dict(allocation["bank"])
+
+        # Select the earliest available write port for every involved bank.
+        selected_write_port = {}
+        port_ready_cycle = request_cycle
+
+        for bank_id in bank_write_size:
+            write_port_id = min(
+                range(self.write_ports_per_bank),
+                key = lambda port_id: self.bank_write_busy_until_cycle[bank_id][port_id],
+            )
+            selected_write_port[bank_id] = write_port_id
+            port_ready_cycle = max(
+                port_ready_cycle,
+                self.bank_write_busy_until_cycle[bank_id][write_port_id],
+            )
+
+        # Start all bank writes together after every selected port is ready.
+        start_cycle = max(request_cycle, port_ready_cycle)
+        wait_cycles = start_cycle - request_cycle
+        finish_cycle = start_cycle
+
+        # Issue one access-width unit per cycle on each selected write port.
+        for bank_id, write_size_byte in bank_write_size.items():
+            issue_cycles = (write_size_byte + self.access_width_byte - 1) // self.access_width_byte
+            write_port_id = selected_write_port[bank_id]
+
+            self.bank_write_busy_until_cycle[bank_id][write_port_id] = start_cycle + issue_cycles
+            bank_finish_cycle = start_cycle + issue_cycles - 1 + self.access_latency_cycles
+            finish_cycle = max(finish_cycle, bank_finish_cycle)
+
+        # The allocation becomes readable when its slowest bank write finishes.
+        allocation["ready_cycle"] = finish_cycle
+
+        service_cycles = finish_cycle - start_cycle
+        total_latency_cycles = finish_cycle - request_cycle
+
+        # Return timing information and the per-bank write workload.
+        return {
+            "request_cycle": request_cycle,
+            "start_cycle": start_cycle,
+            "finish_cycle": finish_cycle,
+            "wait_cycles": wait_cycles,
+            "service_cycles": service_cycles,
+            "total_latency_cycles": total_latency_cycles,
+            "total_write_size_byte": sum(bank_write_size.values()),
+            "bank_write_size": bank_write_size,
+        }
     
 class HBM(Memory):
     def __init__(
