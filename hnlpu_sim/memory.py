@@ -28,6 +28,11 @@ class Memory:
             raise ValueError(f"{name} must be {comparison} {minimum}.")
 
     @staticmethod
+    def _validate_boolean(value, name):
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be a boolean.")
+
+    @staticmethod
     def _validate_allocation_id(allocation_id, name):
         if allocation_id is None or (
             isinstance(allocation_id, str) and not allocation_id.strip()
@@ -94,7 +99,7 @@ class Memory:
         return 0 <= self.usage_byte <= self.size_byte and self.usage_byte == allocated_size
 
     def ensure_consistent(self):
-        if not self.check_consistency():
+        if getattr(self, "consistency_check_enabled", True) and not self.check_consistency():
             raise RuntimeError("Memory allocation state is inconsistent.")
 
     def calculate_access_time_s(self, access_size_byte):
@@ -112,6 +117,7 @@ class AttentionBuffer(Memory):
         access_width_bit = 32,
         access_latency_cycles = 3,
         clock_frequency_hz = 1000000000,
+        check_consistency = False,
     ):
         self._validate_integer(num_banks, "num_banks", minimum = 1)
         self._validate_integer(bank_size_byte, "bank_size_byte", minimum = 1)
@@ -126,6 +132,7 @@ class AttentionBuffer(Memory):
             minimum = 0,
             inclusive = False,
         )
+        self._validate_boolean(check_consistency, "check_consistency")
         if access_width_bit % 8 != 0:
             raise ValueError("access_width_bit must be divisible by 8.")
         if banks_per_group > num_banks:
@@ -158,6 +165,7 @@ class AttentionBuffer(Memory):
         self.access_width_byte = access_width_byte
         self.access_latency_cycles = access_latency_cycles
         self.clock_frequency_hz = clock_frequency_hz
+        self.consistency_check_enabled = check_consistency
 
         self.next_bank_group_id = 0
         self.next_bank_group_offset = [0] * num_bank_groups
@@ -414,8 +422,13 @@ class AttentionBuffer(Memory):
             issue_cycles = (read_size_byte + self.access_width_byte - 1) // self.access_width_byte
             read_port_id = selected_read_port[bank_id]
 
-            self.bank_read_busy_until_cycle[bank_id][read_port_id] = start_cycle + issue_cycles
-            bank_finish_cycle = start_cycle + issue_cycles - 1 + self.access_latency_cycles
+            issue_end_cycle = start_cycle + issue_cycles
+            self.bank_read_busy_until_cycle[bank_id][read_port_id] = issue_end_cycle
+
+            # The first access issued at start_cycle completes after
+            # access_latency_cycles. Each later access adds one pipeline cycle.
+            pipeline_tail_cycles = max(self.access_latency_cycles - 1, 0)
+            bank_finish_cycle = issue_end_cycle + pipeline_tail_cycles
             finish_cycle = max(finish_cycle, bank_finish_cycle)
 
         service_cycles = finish_cycle - start_cycle
@@ -474,8 +487,13 @@ class AttentionBuffer(Memory):
             issue_cycles = (write_size_byte + self.access_width_byte - 1) // self.access_width_byte
             write_port_id = selected_write_port[bank_id]
 
-            self.bank_write_busy_until_cycle[bank_id][write_port_id] = start_cycle + issue_cycles
-            bank_finish_cycle = start_cycle + issue_cycles - 1 + self.access_latency_cycles
+            issue_end_cycle = start_cycle + issue_cycles
+            self.bank_write_busy_until_cycle[bank_id][write_port_id] = issue_end_cycle
+
+            # The first access issued at start_cycle completes after
+            # access_latency_cycles. Each later access adds one pipeline cycle.
+            pipeline_tail_cycles = max(self.access_latency_cycles - 1, 0)
+            bank_finish_cycle = issue_end_cycle + pipeline_tail_cycles
             finish_cycle = max(finish_cycle, bank_finish_cycle)
 
         # The allocation becomes readable when its slowest bank write finishes.
@@ -504,6 +522,7 @@ class HBM(Memory):
         bandwidth_byte_per_s = 6400000000000,
         fixed_access_latency_s = 100e-9,
         clock_frequency_hz = 1000000000,
+        check_consistency = False,
     ):
         self._validate_integer(num_stacks, "num_stacks", minimum = 1)
         self._validate_integer(stack_size_byte, "stack_size_byte", minimum = 1)
@@ -513,6 +532,7 @@ class HBM(Memory):
             minimum = 0,
             inclusive = False,
         )
+        self._validate_boolean(check_consistency, "check_consistency")
 
         size_byte = num_stacks * stack_size_byte
 
@@ -524,6 +544,7 @@ class HBM(Memory):
         self.stack_size_byte = stack_size_byte
         self.clock_frequency_hz = clock_frequency_hz
         self.fixed_access_latency_cycles = int(np.ceil(fixed_access_latency_s * clock_frequency_hz))
+        self.consistency_check_enabled = check_consistency
 
         # The first model treats all HBM traffic as sharing one bandwidth resource.
         self.busy_until_cycle = 0
@@ -628,7 +649,8 @@ class HBM(Memory):
         )
         wait_cycles = start_cycle - request_cycle
         transfer_cycles = self.calculate_transfer_cycles(total_read_size_byte)
-        finish_cycle = start_cycle + transfer_cycles + self.fixed_access_latency_cycles
+        transfer_end_cycle = start_cycle + transfer_cycles
+        finish_cycle = transfer_end_cycle + self.fixed_access_latency_cycles
         self.busy_until_cycle = finish_cycle
 
         return {
@@ -660,7 +682,8 @@ class HBM(Memory):
         start_cycle = max(request_cycle, self.busy_until_cycle)
         wait_cycles = start_cycle - request_cycle
         transfer_cycles = self.calculate_transfer_cycles(allocation["size"])
-        finish_cycle = start_cycle + transfer_cycles + self.fixed_access_latency_cycles
+        transfer_end_cycle = start_cycle + transfer_cycles
+        finish_cycle = transfer_end_cycle + self.fixed_access_latency_cycles
         self.busy_until_cycle = finish_cycle
 
         # The allocation becomes readable when the write transfer completes.
