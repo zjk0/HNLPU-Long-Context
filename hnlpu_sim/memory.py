@@ -368,9 +368,7 @@ class AttentionBuffer(Memory):
         for allocate_id in allocate_ids:
             self._validate_allocation_id(allocate_id, "allocate_id")
             if allocate_id in seen_allocate_ids:
-                raise ValueError(
-                    f"allocate_id({allocate_id}) is duplicated in allocate_ids."
-                )
+                raise ValueError(f"allocate_id({allocate_id}) is duplicated in allocate_ids.")
             if allocate_id not in self.allocate_info:
                 raise ValueError(f"allocate_id({allocate_id}) does not exist.")
 
@@ -379,9 +377,7 @@ class AttentionBuffer(Memory):
 
             # An allocation cannot be read before its write has completed.
             if "ready_cycle" not in allocation:
-                raise RuntimeError(
-                    f"allocate_id({allocate_id}) has not been written."
-                )
+                raise RuntimeError(f"allocate_id({allocate_id}) has not been written.")
             ready_cycle = allocation["ready_cycle"]
             self._validate_integer(
                 ready_cycle,
@@ -391,9 +387,7 @@ class AttentionBuffer(Memory):
             data_ready_cycle = max(data_ready_cycle, ready_cycle)
 
             for bank_id, read_size_byte in allocation["bank"].items():
-                bank_read_size[bank_id] = (
-                    bank_read_size.get(bank_id, 0) + read_size_byte
-                )
+                bank_read_size[bank_id] = bank_read_size.get(bank_id, 0) + read_size_byte
 
         # Select the earliest available read port for every involved bank.
         selected_read_port = {}
@@ -450,9 +444,7 @@ class AttentionBuffer(Memory):
 
         allocation = self.allocate_info[allocate_id]
         if "ready_cycle" in allocation:
-            raise RuntimeError(
-                f"allocate_id({allocate_id}) has already been written."
-            )
+            raise RuntimeError(f"allocate_id({allocate_id}) has already been written.")
 
         # Get the per-bank write workload from the allocation record.
         bank_write_size = dict(allocation["bank"])
@@ -511,9 +503,16 @@ class HBM(Memory):
         stack_size_byte = 24000000000,
         bandwidth_byte_per_s = 6400000000000,
         fixed_access_latency_s = 100e-9,
+        clock_frequency_hz = 1000000000,
     ):
         self._validate_integer(num_stacks, "num_stacks", minimum = 1)
         self._validate_integer(stack_size_byte, "stack_size_byte", minimum = 1)
+        self._validate_number(
+            clock_frequency_hz,
+            "clock_frequency_hz",
+            minimum = 0,
+            inclusive = False,
+        )
 
         size_byte = num_stacks * stack_size_byte
 
@@ -523,3 +522,172 @@ class HBM(Memory):
 
         self.num_stacks = num_stacks
         self.stack_size_byte = stack_size_byte
+        self.clock_frequency_hz = clock_frequency_hz
+        self.fixed_access_latency_cycles = int(np.ceil(fixed_access_latency_s * clock_frequency_hz))
+
+        # The first model treats all HBM traffic as sharing one bandwidth resource.
+        self.busy_until_cycle = 0
+
+    def check_consistency(self):
+        allocated_size = 0
+        for allocation in self.allocate_info.values():
+            if "size" not in allocation or allocation["size"] <= 0:
+                return False
+            allocated_size += allocation["size"]
+
+        return 0 <= self.usage_byte <= self.size_byte and self.usage_byte == allocated_size
+
+    def allocate_memory(self, allocate_size_byte, allocate_id):
+        # Validate the current state and allocation request.
+        self.ensure_consistent()
+        self._validate_integer(
+            allocate_size_byte,
+            "allocate_size_byte",
+            minimum = 1,
+        )
+        self._validate_allocation_id(allocate_id, "allocate_id")
+
+        if allocate_id in self.allocate_info:
+            raise ValueError(f"allocate_id({allocate_id}) has already existed.")
+
+        if self.usage_byte + allocate_size_byte > self.size_byte:
+            return False
+
+        self.usage_byte += allocate_size_byte
+        self.allocate_info[allocate_id] = {"size": allocate_size_byte}
+
+        self.ensure_consistent()
+        return True
+
+    def free_memory(self, free_id):
+        # Validate the current state and target allocation.
+        self.ensure_consistent()
+        self._validate_allocation_id(free_id, "free_id")
+
+        if free_id not in self.allocate_info:
+            raise ValueError(f"free_id({free_id}) does not exist.")
+
+        allocation = self.allocate_info[free_id]
+        self.usage_byte -= allocation["size"]
+        self.allocate_info.pop(free_id)
+
+        self.ensure_consistent()
+        return True
+
+    def calculate_transfer_cycles(self, access_size_byte):
+        self._validate_integer(
+            access_size_byte,
+            "access_size_byte",
+            minimum=1,
+        )
+        return int(
+            np.ceil(access_size_byte * self.clock_frequency_hz / self.bandwidth_byte_per_s)
+        )
+
+    def read(self, allocate_ids, request_cycle):
+        # Validate the memory state and request parameters.
+        self.ensure_consistent()
+        if not isinstance(allocate_ids, list):
+            raise TypeError("allocate_ids must be a list.")
+        if not allocate_ids:
+            raise ValueError("allocate_ids must not be empty.")
+        self._validate_integer(request_cycle, "request_cycle", minimum=0)
+
+        # Validate IDs and combine their sizes into one HBM transfer.
+        seen_allocate_ids = set()
+        total_read_size_byte = 0
+        data_ready_cycle = request_cycle
+
+        for allocate_id in allocate_ids:
+            self._validate_allocation_id(allocate_id, "allocate_id")
+            if allocate_id in seen_allocate_ids:
+                raise ValueError(
+                    f"allocate_id({allocate_id}) is duplicated in allocate_ids."
+                )
+            if allocate_id not in self.allocate_info:
+                raise ValueError(f"allocate_id({allocate_id}) does not exist.")
+
+            seen_allocate_ids.add(allocate_id)
+            allocation = self.allocate_info[allocate_id]
+
+            if "ready_cycle" not in allocation:
+                raise RuntimeError(
+                    f"allocate_id({allocate_id}) has not been written."
+                )
+            ready_cycle = allocation["ready_cycle"]
+            self._validate_integer(
+                ready_cycle,
+                f"ready_cycle of allocate_id({allocate_id})",
+                minimum = 0,
+            )
+
+            total_read_size_byte += allocation["size"]
+            data_ready_cycle = max(data_ready_cycle, ready_cycle)
+
+        # HBM accesses wait for both the data and shared bandwidth resource.
+        start_cycle = max(
+            request_cycle,
+            data_ready_cycle,
+            self.busy_until_cycle,
+        )
+        wait_cycles = start_cycle - request_cycle
+        transfer_cycles = self.calculate_transfer_cycles(total_read_size_byte)
+        finish_cycle = (
+            start_cycle
+            + transfer_cycles
+            + self.fixed_access_latency_cycles
+        )
+        self.busy_until_cycle = finish_cycle
+
+        return {
+            "request_cycle": request_cycle,
+            "start_cycle": start_cycle,
+            "finish_cycle": finish_cycle,
+            "wait_cycles": wait_cycles,
+            "service_cycles": finish_cycle - start_cycle,
+            "total_latency_cycles": finish_cycle - request_cycle,
+            "transfer_cycles": transfer_cycles,
+            "total_read_size_byte": total_read_size_byte,
+            "allocate_ids": list(allocate_ids),
+        }
+
+    def write(self, allocate_id, request_cycle):
+        # Validate the memory state and request parameters.
+        self.ensure_consistent()
+        self._validate_allocation_id(allocate_id, "allocate_id")
+        self._validate_integer(request_cycle, "request_cycle", minimum=0)
+
+        if allocate_id not in self.allocate_info:
+            raise ValueError(f"allocate_id({allocate_id}) does not exist.")
+
+        allocation = self.allocate_info[allocate_id]
+        if "ready_cycle" in allocation:
+            raise RuntimeError(
+                f"allocate_id({allocate_id}) has already been written."
+            )
+
+        # Serialize this write on the shared HBM bandwidth resource.
+        start_cycle = max(request_cycle, self.busy_until_cycle)
+        wait_cycles = start_cycle - request_cycle
+        transfer_cycles = self.calculate_transfer_cycles(allocation["size"])
+        finish_cycle = (
+            start_cycle
+            + transfer_cycles
+            + self.fixed_access_latency_cycles
+        )
+        self.busy_until_cycle = finish_cycle
+
+        # The allocation becomes readable when the write transfer completes.
+        allocation["ready_cycle"] = finish_cycle
+
+        return {
+            "request_cycle": request_cycle,
+            "start_cycle": start_cycle,
+            "finish_cycle": finish_cycle,
+            "wait_cycles": wait_cycles,
+            "service_cycles": finish_cycle - start_cycle,
+            "total_latency_cycles": finish_cycle - request_cycle,
+            "transfer_cycles": transfer_cycles,
+            "total_write_size_byte": allocation["size"],
+            "allocate_id": allocate_id,
+        }
