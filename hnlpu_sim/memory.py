@@ -996,14 +996,242 @@ if __name__ == "__main__":
         )
         print("Small-capacity AttentionBuffer test: PASSED")
 
+    def assert_hbm_usage_state(
+        hbm,
+        expected_usage_byte,
+        expected_allocation_count,
+    ):
+        allocation_usage = sum(
+            allocation["size"]
+            for allocation in hbm.allocate_info.values()
+        )
+
+        assert hbm.usage_byte == expected_usage_byte
+        assert allocation_usage == expected_usage_byte
+        assert len(hbm.allocate_info) == expected_allocation_count
+        assert hbm.check_consistency()
+
+    def print_hbm_state(hbm, stage, print_allocate_info = True):
+        print(f"\n=== {stage} ===")
+        print(f"size_byte: {hbm.size_byte}")
+        print(f"usage_byte: {hbm.usage_byte}")
+        print(f"remaining_size_byte: {hbm.get_remaining_size()}")
+        print(f"usage_ratio: {hbm.get_usage_ratio():.8f}")
+        print(f"allocation_count: {len(hbm.allocate_info)}")
+        print(f"busy_until_cycle: {hbm.busy_until_cycle}")
+        if print_allocate_info:
+            print("allocate_info:")
+            pprint(hbm.allocate_info)
+
+    def run_large_hbm_capacity_test():
+        print("\n##### Large-capacity HBM test #####")
+
+        hbm = HBM(check_consistency = True)
+        test_allocations = [
+            (str(uuid.uuid4()), hbm.stack_size_byte)
+            for _ in range(hbm.num_stacks)
+        ]
+
+        expected_usage_byte = 0
+        for allocate_id, allocate_size_byte in test_allocations:
+            assert hbm.allocate_memory(allocate_size_byte, allocate_id)
+            expected_usage_byte += allocate_size_byte
+
+        assert_hbm_usage_state(
+            hbm,
+            hbm.size_byte,
+            len(test_allocations),
+        )
+        assert hbm.is_full()
+        print_hbm_state(
+            hbm,
+            "After filling HBM",
+            print_allocate_info = False,
+        )
+
+        sample_ids = [
+            test_allocations[0][0],
+            test_allocations[-1][0],
+        ]
+        print("allocate_info samples:")
+        pprint(
+            {
+                allocate_id: hbm.allocate_info[allocate_id]
+                for allocate_id in sample_ids
+            }
+        )
+
+        usage_before_overflow = hbm.usage_byte
+        allocation_count_before_overflow = len(hbm.allocate_info)
+        overflow_id = str(uuid.uuid4())
+        overflow_result = hbm.allocate_memory(1, overflow_id)
+
+        assert overflow_result is False
+        assert overflow_id not in hbm.allocate_info
+        assert hbm.usage_byte == usage_before_overflow
+        assert (
+            len(hbm.allocate_info)
+            == allocation_count_before_overflow
+        )
+        assert hbm.check_consistency()
+        print(
+            "HBM overflow allocation was correctly rejected without "
+            "changing the capacity state."
+        )
+
+        previous_finish_cycle = 0
+        for allocate_id, expected_size_byte in test_allocations:
+            write_result = hbm.write(
+                allocate_id,
+                request_cycle = 0,
+            )
+            assert write_result["start_cycle"] == previous_finish_cycle
+            assert (
+                write_result["total_write_size_byte"]
+                == expected_size_byte
+            )
+            previous_finish_cycle = write_result["finish_cycle"]
+            assert hbm.busy_until_cycle == previous_finish_cycle
+
+        assert_hbm_usage_state(
+            hbm,
+            hbm.size_byte,
+            len(test_allocations),
+        )
+        print(
+            "All large HBM allocations were written serially; "
+            f"latest finish cycle: {previous_finish_cycle}"
+        )
+
+        read_result = hbm.read(
+            [allocate_id for allocate_id, _ in test_allocations],
+            request_cycle = 0,
+        )
+        assert read_result["start_cycle"] == previous_finish_cycle
+        assert read_result["total_read_size_byte"] == hbm.size_byte
+        assert hbm.busy_until_cycle == read_result["finish_cycle"]
+        assert_hbm_usage_state(
+            hbm,
+            hbm.size_byte,
+            len(test_allocations),
+        )
+        print(
+            "Large HBM read completed: "
+            f"start_cycle={read_result['start_cycle']}, "
+            f"finish_cycle={read_result['finish_cycle']}, "
+            f"transfer_cycles={read_result['transfer_cycles']}"
+        )
+
+        remaining_allocation_count = len(test_allocations)
+        for allocate_id, allocate_size_byte in test_allocations:
+            assert hbm.free_memory(allocate_id)
+            expected_usage_byte -= allocate_size_byte
+            remaining_allocation_count -= 1
+            assert_hbm_usage_state(
+                hbm,
+                expected_usage_byte,
+                remaining_allocation_count,
+            )
+
+        assert hbm.is_empty()
+        assert not hbm.allocate_info
+        print_hbm_state(hbm, "After freeing all large HBM requests")
+        print("Large-capacity HBM test: PASSED")
+
+    def run_small_hbm_capacity_test():
+        print("\n##### Small-capacity HBM test #####")
+
+        hbm = HBM(
+            num_stacks = 1,
+            stack_size_byte = 32,
+            bandwidth_byte_per_s = 4,
+            fixed_access_latency_s = 2,
+            clock_frequency_hz = 1,
+            check_consistency = True,
+        )
+        allocation_sizes = [1, 2, 3, 4, 5, 7]
+        test_allocations = [
+            (str(uuid.uuid4()), allocation_size_byte)
+            for allocation_size_byte in allocation_sizes
+        ]
+
+        expected_usage_byte = 0
+        allocated_count = 0
+        print_hbm_state(hbm, "Initial small HBM state")
+
+        for allocate_id, allocate_size_byte in test_allocations:
+            assert hbm.allocate_memory(allocate_size_byte, allocate_id)
+            expected_usage_byte += allocate_size_byte
+            allocated_count += 1
+            assert_hbm_usage_state(
+                hbm,
+                expected_usage_byte,
+                allocated_count,
+            )
+
+        print_hbm_state(hbm, "After allocating small HBM requests")
+
+        previous_finish_cycle = 0
+        for allocate_id, expected_size_byte in test_allocations:
+            write_result = hbm.write(
+                allocate_id,
+                request_cycle = 0,
+            )
+            assert write_result["start_cycle"] == previous_finish_cycle
+            assert (
+                write_result["total_write_size_byte"]
+                == expected_size_byte
+            )
+            previous_finish_cycle = write_result["finish_cycle"]
+
+        read_result = hbm.read(
+            [allocate_id for allocate_id, _ in test_allocations],
+            request_cycle = 0,
+        )
+        assert read_result["start_cycle"] == previous_finish_cycle
+        assert read_result["total_read_size_byte"] == expected_usage_byte
+        assert (
+            read_result["finish_cycle"]
+            == read_result["start_cycle"]
+            + read_result["transfer_cycles"]
+            + hbm.fixed_access_latency_cycles
+        )
+        assert_hbm_usage_state(
+            hbm,
+            expected_usage_byte,
+            len(test_allocations),
+        )
+
+        print("\nSmall-capacity HBM read result:")
+        pprint(read_result)
+        print_hbm_state(hbm, "After small HBM read")
+
+        remaining_allocation_count = len(test_allocations)
+        for allocate_id, allocate_size_byte in test_allocations:
+            assert hbm.free_memory(allocate_id)
+            expected_usage_byte -= allocate_size_byte
+            remaining_allocation_count -= 1
+            assert_hbm_usage_state(
+                hbm,
+                expected_usage_byte,
+                remaining_allocation_count,
+            )
+
+        assert hbm.is_empty()
+        assert not hbm.allocate_info
+        print_hbm_state(hbm, "After freeing all small HBM requests")
+        print("Small-capacity HBM test: PASSED")
+
     try:
         run_large_capacity_test()
         run_small_capacity_test()
+        run_large_hbm_capacity_test()
+        run_small_hbm_capacity_test()
 
-        print("\nAll AttentionBuffer capacity tests: PASSED")
+        print("\nAll AttentionBuffer and HBM capacity tests: PASSED")
     except Exception as exc:
         print(
-            "\nAttentionBuffer capacity tests: "
+            "\nAttentionBuffer or HBM capacity tests: "
             f"FAILED ({exc})"
         )
         raise
