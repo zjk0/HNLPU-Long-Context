@@ -561,7 +561,7 @@ class HBM(Memory):
         self.num_stacks = num_stacks
         self.stack_size_byte = stack_size_byte
         self.clock_frequency_hz = clock_frequency_hz
-        self.fixed_access_latency_cycles = int(np.ceil(fixed_access_latency_s * clock_frequency_hz))
+        self.fixed_access_latency_cycles = math.ceil(fixed_access_latency_s * clock_frequency_hz)
         self.consistency_check_enabled = check_consistency
 
         # The first model treats all HBM traffic as sharing one bandwidth resource.
@@ -619,9 +619,7 @@ class HBM(Memory):
             "access_size_byte",
             minimum = 1,
         )
-        return int(
-            np.ceil(access_size_byte * self.clock_frequency_hz / self.bandwidth_byte_per_s)
-        )
+        return math.ceil(access_size_byte * self.clock_frequency_hz / self.bandwidth_byte_per_s)
 
     def read(self, allocate_ids, request_cycle):
         # Validate the memory state and request parameters.
