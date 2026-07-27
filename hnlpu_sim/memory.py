@@ -1,4 +1,5 @@
 import numpy as np
+import math
 
 class Memory:
     def __init__(self, size_byte, bandwidth_byte_per_s, fixed_access_latency_s):
@@ -264,7 +265,6 @@ class AttentionBuffer(Memory):
         is_over_bank_groups = True
         is_over_banks_in_group = True
         temp_next_bank_group_id = self.next_bank_group_id
-        # Assume that allocate_size_byte % 4 == 0.
         allocate_bank_num = allocate_size_byte // self.access_width_byte
         base_num_per_bank = allocate_bank_num // self.banks_per_group
         additional_num = allocate_bank_num % self.banks_per_group
@@ -290,16 +290,26 @@ class AttentionBuffer(Memory):
 
                 # Check banks receiving one additional access-width unit.
                 is_additional_num_ok = True
-                for i in range(additional_num):
-                    offset = (self.next_bank_group_offset[group_id] + i) % self.banks_per_group
-                    if (
-                        self.bank_usage_byte[group_start_id + offset]
-                        + self.access_width_byte * base_num_per_bank
-                        + self.access_width_byte
-                        > self.bank_size_byte
-                    ):
-                        is_additional_num_ok = False
-                        break
+                for j in range(additional_num + 1):
+                    offset = (self.next_bank_group_offset[group_id] + j) % self.banks_per_group
+                    if j == additional_num and allocate_size_byte % self.access_width_byte != 0:
+                        if (
+                            self.bank_usage_byte[group_start_id + offset]
+                            + self.access_width_byte * base_num_per_bank
+                            + (allocate_size_byte % self.access_width_byte)
+                            > self.bank_size_byte
+                        ):
+                            is_additional_num_ok = False
+                            break
+                    if j < additional_num:
+                        if (
+                            self.bank_usage_byte[group_start_id + offset]
+                            + self.access_width_byte * base_num_per_bank
+                            + self.access_width_byte
+                            > self.bank_size_byte
+                        ):
+                            is_additional_num_ok = False
+                            break
                 if is_additional_num_ok:
                     is_over_banks_in_group = False
                     break
@@ -322,10 +332,14 @@ class AttentionBuffer(Memory):
         # Commit the striped per-bank allocation.
         temp_allocate_info["bank"] = {}
         self.bank_usage_byte[group_start_id : group_end_id + 1] += self.access_width_byte * base_num_per_bank
-        for i in range(additional_num):
+        for i in range(additional_num + 1):
             offset = (self.next_bank_group_offset[self.next_bank_group_id] + i) % self.banks_per_group
-            self.bank_usage_byte[group_start_id + offset] += self.access_width_byte
-            temp_allocate_info["bank"][group_start_id + offset] = self.access_width_byte
+            if i == additional_num and allocate_size_byte % self.access_width_byte != 0:
+                self.bank_usage_byte[group_start_id + offset] += (allocate_size_byte % self.access_width_byte)
+                temp_allocate_info["bank"][group_start_id + offset] = (allocate_size_byte % self.access_width_byte)
+            if i < additional_num:
+                self.bank_usage_byte[group_start_id + offset] += self.access_width_byte
+                temp_allocate_info["bank"][group_start_id + offset] = self.access_width_byte
 
         if base_num_per_bank > 0:
             for i in range(self.banks_per_group):
@@ -336,7 +350,8 @@ class AttentionBuffer(Memory):
 
         # Publish the allocation and advance round-robin cursors.
         self.allocate_info[allocate_id] = temp_allocate_info
-        self.next_bank_group_offset[self.next_bank_group_id] = (self.next_bank_group_offset[self.next_bank_group_id] + additional_num) % self.banks_per_group
+        real_additional_num = additional_num if allocate_size_byte % self.access_width_byte == 0 else additional_num + 1
+        self.next_bank_group_offset[self.next_bank_group_id] = (self.next_bank_group_offset[self.next_bank_group_id] + real_additional_num) % self.banks_per_group
         self.next_bank_group_id = (self.next_bank_group_id + 1) % self.num_bank_groups
 
         self.ensure_consistent()
@@ -368,9 +383,10 @@ class AttentionBuffer(Memory):
             raise ValueError("allocate_ids must not be empty.")
         self._validate_integer(request_cycle, "request_cycle", minimum = 0)
 
-        # Validate IDs, reject duplicates, and merge accesses to the same bank.
+        # Validate IDs and collect each bank's byte and access workloads.
         seen_allocate_ids = set()
         bank_read_size = {}
+        bank_read_issue_cycles = {}
         data_ready_cycle = request_cycle
 
         for allocate_id in allocate_ids:
@@ -396,12 +412,14 @@ class AttentionBuffer(Memory):
 
             for bank_id, read_size_byte in allocation["bank"].items():
                 bank_read_size[bank_id] = bank_read_size.get(bank_id, 0) + read_size_byte
+                allocation_issue_cycles = (read_size_byte + self.access_width_byte - 1) // self.access_width_byte
+                bank_read_issue_cycles[bank_id] = bank_read_issue_cycles.get(bank_id, 0) + allocation_issue_cycles
 
         # Select the earliest available read port for every involved bank.
         selected_read_port = {}
         port_ready_cycle = request_cycle
 
-        for bank_id in bank_read_size:
+        for bank_id in bank_read_issue_cycles:
             read_port_id = min(
                 range(self.read_ports_per_bank),
                 key = lambda port_id: self.bank_read_busy_until_cycle[bank_id][port_id],
@@ -418,8 +436,7 @@ class AttentionBuffer(Memory):
         finish_cycle = start_cycle
 
         # Issue one access-width unit per cycle on each selected read port.
-        for bank_id, read_size_byte in bank_read_size.items():
-            issue_cycles = (read_size_byte + self.access_width_byte - 1) // self.access_width_byte
+        for bank_id, issue_cycles in bank_read_issue_cycles.items():
             read_port_id = selected_read_port[bank_id]
 
             issue_end_cycle = start_cycle + issue_cycles
@@ -444,6 +461,7 @@ class AttentionBuffer(Memory):
             "total_latency_cycles": total_latency_cycles,
             "total_read_size_byte": sum(bank_read_size.values()),
             "bank_read_size": bank_read_size,
+            "bank_read_issue_cycles": bank_read_issue_cycles,
         }
     
     def write(self, allocate_id, request_cycle):
