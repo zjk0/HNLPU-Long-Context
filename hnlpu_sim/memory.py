@@ -700,3 +700,20 @@ class HBM(Memory):
             "total_write_size_byte": allocation["size"],
             "allocate_id": allocate_id,
         }
+        
+if __name__ == "__main__":
+    import uuid
+    attention_buffer = AttentionBuffer()
+    attention_buffer.allocate_memory(100, str(uuid.uuid4()))
+    for key, value in attention_buffer.allocate_info.items():
+        print(f"{key}:\n{value}")
+    print("----------------------------------------------------")
+    for i in range(attention_buffer.num_bank_groups):
+        if attention_buffer.bank_group_usage_byte[i] != 0:
+            bank_group_usage = attention_buffer.bank_group_usage_byte[i]
+            print(f"bank group {i}: {bank_group_usage} bytes")
+    print("----------------------------------------------------")
+    indices = np.nonzero(attention_buffer.bank_usage_byte)[0]
+    for index in indices:
+        bank_usage = attention_buffer.bank_usage_byte[index]
+        print(f"bank {index}: {bank_usage} bytes")
