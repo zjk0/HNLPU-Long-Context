@@ -719,17 +719,291 @@ class HBM(Memory):
         
 if __name__ == "__main__":
     import uuid
-    attention_buffer = AttentionBuffer()
-    attention_buffer.allocate_memory(100, str(uuid.uuid4()))
-    for key, value in attention_buffer.allocate_info.items():
-        print(f"{key}:\n{value}")
-    print("----------------------------------------------------")
-    for i in range(attention_buffer.num_bank_groups):
-        if attention_buffer.bank_group_usage_byte[i] != 0:
-            bank_group_usage = attention_buffer.bank_group_usage_byte[i]
-            print(f"bank group {i}: {bank_group_usage} bytes")
-    print("----------------------------------------------------")
-    indices = np.nonzero(attention_buffer.bank_usage_byte)[0]
-    for index in indices:
-        bank_usage = attention_buffer.bank_usage_byte[index]
-        print(f"bank {index}: {bank_usage} bytes")
+    from pprint import pprint
+
+    def assert_usage_state(
+        attention_buffer,
+        expected_usage_byte,
+        expected_allocation_count,
+    ):
+        allocation_usage = sum(
+            allocation["size"]
+            for allocation in attention_buffer.allocate_info.values()
+        )
+        bank_group_usage = sum(attention_buffer.bank_group_usage_byte)
+        bank_usage = int(np.sum(attention_buffer.bank_usage_byte))
+
+        assert attention_buffer.usage_byte == expected_usage_byte
+        assert allocation_usage == expected_usage_byte
+        assert bank_group_usage == expected_usage_byte
+        assert bank_usage == expected_usage_byte
+        assert len(attention_buffer.allocate_info) == expected_allocation_count
+
+    def print_usage_summary(attention_buffer, stage):
+        active_group_count = sum(
+            usage != 0
+            for usage in attention_buffer.bank_group_usage_byte
+        )
+        active_bank_count = int(
+            np.count_nonzero(attention_buffer.bank_usage_byte)
+        )
+
+        print(f"\n=== {stage} ===")
+        print(f"size_byte: {attention_buffer.size_byte}")
+        print(f"usage_byte: {attention_buffer.usage_byte}")
+        print(f"remaining_size_byte: {attention_buffer.get_remaining_size()}")
+        print(f"usage_ratio: {attention_buffer.get_usage_ratio():.8f}")
+        print(f"allocation_count: {len(attention_buffer.allocate_info)}")
+        print(f"active_bank_group_count: {active_group_count}")
+        print(f"active_bank_count: {active_bank_count}")
+
+    def print_small_buffer_state(attention_buffer, stage):
+        active_group_usage = {
+            group_id: usage
+            for group_id, usage in enumerate(
+                attention_buffer.bank_group_usage_byte
+            )
+            if usage != 0
+        }
+        active_bank_usage = {
+            int(bank_id): int(attention_buffer.bank_usage_byte[bank_id])
+            for bank_id in np.flatnonzero(attention_buffer.bank_usage_byte)
+        }
+
+        print(f"\n=== {stage} ===")
+        print(f"usage_byte: {attention_buffer.usage_byte}")
+        print(f"remaining_size_byte: {attention_buffer.get_remaining_size()}")
+        print("active_bank_group_usage_byte:")
+        pprint(active_group_usage)
+        print("active_bank_usage_byte:")
+        pprint(active_bank_usage)
+        print("allocate_info:")
+        pprint(attention_buffer.allocate_info)
+
+    def run_large_capacity_test():
+        print("\n##### Large-capacity AttentionBuffer test #####")
+
+        attention_buffer = AttentionBuffer(check_consistency = False)
+        allocation_size_byte = attention_buffer.bank_group_size_byte
+        test_allocations = []
+
+        for _ in range(attention_buffer.num_bank_groups):
+            allocate_id = str(uuid.uuid4())
+            assert attention_buffer.allocate_memory(
+                allocation_size_byte,
+                allocate_id,
+            )
+            test_allocations.append((allocate_id, allocation_size_byte))
+
+        assert_usage_state(
+            attention_buffer,
+            attention_buffer.size_byte,
+            attention_buffer.num_bank_groups,
+        )
+        assert attention_buffer.check_consistency()
+        assert attention_buffer.is_full()
+        print_usage_summary(attention_buffer, "After filling the buffer")
+
+        sample_ids = [
+            test_allocations[0][0],
+            test_allocations[-1][0],
+        ]
+        print("allocate_info samples:")
+        pprint(
+            {
+                allocate_id: attention_buffer.allocate_info[allocate_id]
+                for allocate_id in sample_ids
+            }
+        )
+
+        usage_before_overflow = attention_buffer.usage_byte
+        allocation_count_before_overflow = len(
+            attention_buffer.allocate_info
+        )
+        overflow_id = str(uuid.uuid4())
+        overflow_result = attention_buffer.allocate_memory(1, overflow_id)
+
+        assert overflow_result is False
+        assert overflow_id not in attention_buffer.allocate_info
+        assert attention_buffer.usage_byte == usage_before_overflow
+        assert (
+            len(attention_buffer.allocate_info)
+            == allocation_count_before_overflow
+        )
+        assert attention_buffer.check_consistency()
+        print(
+            "Overflow allocation was correctly rejected without changing "
+            "the capacity state."
+        )
+
+        latest_write_finish_cycle = 0
+        for allocate_id, expected_size_byte in test_allocations:
+            write_result = attention_buffer.write(
+                allocate_id,
+                request_cycle = 0,
+            )
+            assert (
+                write_result["total_write_size_byte"]
+                == expected_size_byte
+            )
+            latest_write_finish_cycle = max(
+                latest_write_finish_cycle,
+                write_result["finish_cycle"],
+            )
+
+        assert_usage_state(
+            attention_buffer,
+            attention_buffer.size_byte,
+            attention_buffer.num_bank_groups,
+        )
+        assert attention_buffer.check_consistency()
+        print(
+            "All large allocations were written; latest finish cycle: "
+            f"{latest_write_finish_cycle}"
+        )
+
+        read_result = attention_buffer.read(
+            [allocate_id for allocate_id, _ in test_allocations],
+            request_cycle = 0,
+        )
+        assert (
+            read_result["total_read_size_byte"]
+            == attention_buffer.size_byte
+        )
+        assert read_result["start_cycle"] >= latest_write_finish_cycle
+
+        assert_usage_state(
+            attention_buffer,
+            attention_buffer.size_byte,
+            attention_buffer.num_bank_groups,
+        )
+        assert attention_buffer.check_consistency()
+        print(
+            "Large read completed: "
+            f"start_cycle={read_result['start_cycle']}, "
+            f"finish_cycle={read_result['finish_cycle']}, "
+            f"total_read_size_byte={read_result['total_read_size_byte']}"
+        )
+
+        expected_usage_byte = attention_buffer.size_byte
+        remaining_allocation_count = len(test_allocations)
+        for allocate_id, allocate_size_byte in test_allocations:
+            assert attention_buffer.free_memory(allocate_id)
+            expected_usage_byte -= allocate_size_byte
+            remaining_allocation_count -= 1
+            assert_usage_state(
+                attention_buffer,
+                expected_usage_byte,
+                remaining_allocation_count,
+            )
+
+        assert attention_buffer.is_empty()
+        assert not attention_buffer.allocate_info
+        assert not np.any(attention_buffer.bank_usage_byte)
+        assert not any(attention_buffer.bank_group_usage_byte)
+        assert attention_buffer.check_consistency()
+        print_usage_summary(attention_buffer, "After freeing all requests")
+        print("Large-capacity AttentionBuffer test: PASSED")
+
+    def run_small_capacity_test():
+        print("\n##### Small-capacity AttentionBuffer test #####")
+
+        attention_buffer = AttentionBuffer(
+            num_banks = 4,
+            bank_size_byte = 8,
+            banks_per_group = 4,
+            check_consistency = True,
+        )
+        allocation_sizes = [1, 2, 3, 4, 5, 7]
+        test_allocations = [
+            (str(uuid.uuid4()), allocation_size_byte)
+            for allocation_size_byte in allocation_sizes
+        ]
+
+        expected_usage_byte = 0
+        allocated_count = 0
+        print_small_buffer_state(attention_buffer, "Initial small state")
+
+        for allocate_id, allocate_size_byte in test_allocations:
+            assert attention_buffer.allocate_memory(
+                allocate_size_byte,
+                allocate_id,
+            )
+            expected_usage_byte += allocate_size_byte
+            allocated_count += 1
+            assert_usage_state(
+                attention_buffer,
+                expected_usage_byte,
+                allocated_count,
+            )
+
+        assert attention_buffer.check_consistency()
+        print_small_buffer_state(
+            attention_buffer,
+            "After allocating small requests",
+        )
+
+        latest_write_finish_cycle = 0
+        for allocate_id, expected_size_byte in test_allocations:
+            write_result = attention_buffer.write(
+                allocate_id,
+                request_cycle = 0,
+            )
+            assert (
+                write_result["total_write_size_byte"]
+                == expected_size_byte
+            )
+            latest_write_finish_cycle = max(
+                latest_write_finish_cycle,
+                write_result["finish_cycle"],
+            )
+
+        read_result = attention_buffer.read(
+            [allocate_id for allocate_id, _ in test_allocations],
+            request_cycle = 0,
+        )
+        assert read_result["total_read_size_byte"] == expected_usage_byte
+        assert read_result["start_cycle"] >= latest_write_finish_cycle
+        assert_usage_state(
+            attention_buffer,
+            expected_usage_byte,
+            len(test_allocations),
+        )
+
+        print("\nSmall-capacity read result:")
+        pprint(read_result)
+        print_small_buffer_state(attention_buffer, "After small read")
+
+        remaining_allocation_count = len(test_allocations)
+        for allocate_id, allocate_size_byte in test_allocations:
+            assert attention_buffer.free_memory(allocate_id)
+            expected_usage_byte -= allocate_size_byte
+            remaining_allocation_count -= 1
+            assert_usage_state(
+                attention_buffer,
+                expected_usage_byte,
+                remaining_allocation_count,
+            )
+
+        assert attention_buffer.is_empty()
+        assert not attention_buffer.allocate_info
+        assert not np.any(attention_buffer.bank_usage_byte)
+        assert not any(attention_buffer.bank_group_usage_byte)
+        assert attention_buffer.check_consistency()
+        print_small_buffer_state(
+            attention_buffer,
+            "After freeing all small requests",
+        )
+        print("Small-capacity AttentionBuffer test: PASSED")
+
+    try:
+        run_large_capacity_test()
+        run_small_capacity_test()
+
+        print("\nAll AttentionBuffer capacity tests: PASSED")
+    except Exception as exc:
+        print(
+            "\nAttentionBuffer capacity tests: "
+            f"FAILED ({exc})"
+        )
+        raise
