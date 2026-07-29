@@ -1,3 +1,7 @@
+import uuid
+import numpy as np
+from memory import AttentionBuffer, HBM
+
 class KVcacheBlock:
     def __init__(
         self,
@@ -25,5 +29,15 @@ class KVcacheBlock:
         self.allocate_id = allocate_id
     
 class KVcacheManager:
-    def __init__(self):
-        pass
+    def __init__(
+        self, 
+        chip_id,  
+        attention_buffer: AttentionBuffer, 
+        hbm: HBM
+    ):
+        self.chip_id = chip_id
+        self.attention_buffer = attention_buffer
+        self.hbm = hbm
+        self.kv_cache_blocks = {}
+        self.request_blocks = {}
+        self.request_layer_blocks = {}
