@@ -228,45 +228,35 @@ class KVcacheManager:
             elif block.storage_location == "hbm":
                 allocate_ids_hbm.append(block.allocate_id)
 
-        if allocate_ids_attention_buffer and not allocate_ids_hbm:
+        read_result_attention_buffer = None
+        read_result_hbm = None
+
+        if allocate_ids_attention_buffer:
             read_result_attention_buffer = self.attention_buffer.read(allocate_ids_attention_buffer, request_cycle)
-            return read_result_attention_buffer
-        elif not allocate_ids_attention_buffer and allocate_ids_hbm:
-            read_result_hbm = self.hbm.read(allocate_ids_hbm, request_cycle)
-            return read_result_hbm
-        elif allocate_ids_attention_buffer and allocate_ids_hbm:
-            read_result_attention_buffer = self.attention_buffer.read(allocate_ids_attention_buffer, request_cycle)
+        if allocate_ids_hbm:
             read_result_hbm = self.hbm.read(allocate_ids_hbm, request_cycle)
 
-            start_cycle = min(read_result_attention_buffer["start_cycle"], read_result_hbm["start_cycle"])
-            finish_cycle = max(read_result_attention_buffer["finish_cycle"], read_result_hbm["finish_cycle"])
+        read_results = [
+            read_result for read_result in (read_result_attention_buffer, read_result_hbm)
+            if read_result is not None
+        ]
+        if not read_results:
+            raise RuntimeError("No valid KV cache allocation was found to read.")
 
-            return {
-                "request_cycle": request_cycle,
-                "start_cycle": start_cycle,
-                "finish_cycle": finish_cycle,
-                "wait_cycles": start_cycle - request_cycle,
-                "service_cycles": finish_cycle - start_cycle,
-                "total_latency_cycles": finish_cycle - request_cycle,
-                "total_read_size_byte": (
-                    read_result_attention_buffer["total_read_size_byte"]
-                    + read_result_hbm["total_read_size_byte"]
-                ),
-                "bank_read_size": read_result_attention_buffer[
-                    "bank_read_size"
-                ],
-                "bank_read_issue_cycles": read_result_attention_buffer[
-                    "bank_read_issue_cycles"
-                ],
-                "hbm_transfer_cycles": read_result_hbm[
-                    "transfer_cycles"
-                ],
-                "attention_buffer_result": read_result_attention_buffer,
-                "hbm_result": read_result_hbm,
-            }
+        start_cycle = min(read_result["start_cycle"] for read_result in read_results)
+        finish_cycle = max(read_result["finish_cycle"] for read_result in read_results)
 
-        raise RuntimeError("No valid KV cache allocation was found to read.")
-
+        return {
+            "request_cycle": request_cycle,
+            "start_cycle": start_cycle,
+            "finish_cycle": finish_cycle,
+            "wait_cycles": start_cycle - request_cycle,
+            "service_cycles": finish_cycle - start_cycle,
+            "total_latency_cycles": finish_cycle - request_cycle,
+            "total_read_size_byte": sum(read_result["total_read_size_byte"] for read_result in read_results),
+            "attention_buffer_result": read_result_attention_buffer,
+            "hbm_result": read_result_hbm,
+        }
 
     def free_kv_block(self, block_id):
         pass
