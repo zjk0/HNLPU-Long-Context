@@ -229,35 +229,17 @@ class KVcacheManager:
                 allocate_ids_hbm.append(block.allocate_id)
 
         if allocate_ids_attention_buffer and not allocate_ids_hbm:
-            read_result_attention_buffer = self.attention_buffer.read(
-                allocate_ids_attention_buffer,
-                request_cycle,
-            )
+            read_result_attention_buffer = self.attention_buffer.read(allocate_ids_attention_buffer, request_cycle)
             return read_result_attention_buffer
         elif not allocate_ids_attention_buffer and allocate_ids_hbm:
-            read_result_hbm = self.hbm.read(
-                allocate_ids_hbm,
-                request_cycle,
-            )
+            read_result_hbm = self.hbm.read(allocate_ids_hbm, request_cycle)
             return read_result_hbm
         elif allocate_ids_attention_buffer and allocate_ids_hbm:
-            read_result_attention_buffer = self.attention_buffer.read(
-                allocate_ids_attention_buffer,
-                request_cycle,
-            )
-            read_result_hbm = self.hbm.read(
-                allocate_ids_hbm,
-                request_cycle,
-            )
+            read_result_attention_buffer = self.attention_buffer.read(allocate_ids_attention_buffer, request_cycle)
+            read_result_hbm = self.hbm.read(allocate_ids_hbm, request_cycle)
 
-            start_cycle = min(
-                read_result_attention_buffer["start_cycle"],
-                read_result_hbm["start_cycle"],
-            )
-            finish_cycle = max(
-                read_result_attention_buffer["finish_cycle"],
-                read_result_hbm["finish_cycle"],
-            )
+            start_cycle = min(read_result_attention_buffer["start_cycle"], read_result_hbm["start_cycle"])
+            finish_cycle = max(read_result_attention_buffer["finish_cycle"], read_result_hbm["finish_cycle"])
 
             return {
                 "request_cycle": request_cycle,
