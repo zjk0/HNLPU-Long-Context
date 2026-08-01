@@ -34,16 +34,92 @@ class KVcacheManager:
         self, 
         chip_id,  
         attention_buffer: AttentionBuffer, 
-        hbm: HBM
+        hbm: HBM,
+        check_consistency = False,
     ):
+        if not isinstance(check_consistency, bool):
+            raise TypeError("check_consistency must be a boolean.")
+
         self.chip_id = chip_id
         self.attention_buffer = attention_buffer
         self.hbm = hbm
+        self.consistency_check_enabled = check_consistency
         self.kv_cache_blocks = {}
         self.request_blocks = {}
         self.request_layer_blocks = {}
 
+    def check_consistency(self):
+        try:
+            if not self.attention_buffer.check_consistency():
+                return False
+            if not self.hbm.check_consistency():
+                return False
+
+            expected_request_blocks = {}
+            expected_request_layer_blocks = {}
+            seen_allocate_ids = set()
+
+            for block_id, block in self.kv_cache_blocks.items():
+                if not isinstance(block, KVcacheBlock):
+                    return False
+                if block.block_id != block_id:
+                    return False
+                if block.chip_id != self.chip_id:
+                    return False
+                if block.storage_location not in ("attention_buffer", "hbm"):
+                    return False
+                if block.allocate_id is None:
+                    return False
+
+                hash(block.request_id)
+                hash(block.layer_id)
+                hash(block.allocate_id)
+
+                if block.allocate_id in seen_allocate_ids:
+                    return False
+                seen_allocate_ids.add(block.allocate_id)
+
+                if block.storage_location == "attention_buffer":
+                    target_memory = self.attention_buffer
+                    other_memory = self.hbm
+                else:
+                    target_memory = self.hbm
+                    other_memory = self.attention_buffer
+
+                if block.allocate_id not in target_memory.allocate_info:
+                    return False
+                if block.allocate_id in other_memory.allocate_info:
+                    return False
+
+                allocation = target_memory.allocate_info[block.allocate_id]
+                if allocation.get("size") != block.size_byte:
+                    return False
+                if "ready_cycle" not in allocation:
+                    return False
+
+                expected_request_blocks.setdefault(block.request_id, set()).add(block_id)
+                expected_request_layer_blocks.setdefault((block.request_id, block.layer_id), []).append(block_id)
+
+            for block_ids in expected_request_layer_blocks.values():
+                block_ids.sort(
+                    key = lambda block_id: self.kv_cache_blocks[block_id].first_token_position
+                )
+
+            return (
+                self.request_blocks == expected_request_blocks
+                and self.request_layer_blocks
+                == expected_request_layer_blocks
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
+
+    def ensure_consistent(self):
+        if self.consistency_check_enabled and not self.check_consistency():
+            raise RuntimeError("KVcacheManager state is inconsistent.")
+
     def store_kv_block(self, block: KVcacheBlock, request_cycle):
+        self.ensure_consistent()
+
         # Validate the block, request cycle, chip ownership, and block state.
         if not isinstance(block, KVcacheBlock):
             raise TypeError("block must be a KVcacheBlock.")
@@ -70,10 +146,7 @@ class KVcacheManager:
                 raise TypeError(f"{name} must be hashable.") from exc
 
         # Detect an allocation that exists in memory but is missing from Manager.
-        if (
-            block.block_id in self.attention_buffer.allocate_info
-            or block.block_id in self.hbm.allocate_info
-        ):
+        if block.block_id in self.attention_buffer.allocate_info or block.block_id in self.hbm.allocate_info:
             raise RuntimeError(
                 f"block_id({block.block_id}) already exists in memory "
                 "but is not registered in KVcacheManager."
@@ -140,10 +213,14 @@ class KVcacheManager:
             target_memory.free_memory(block.block_id)
             raise
 
+        self.ensure_consistent()
+
         # Return the timing information produced by the selected memory.
         return write_result
 
     def read_kv_blocks(self, block_ids, request_cycle):
+        self.ensure_consistent()
+
         # Validate the request parameters.
         if not isinstance(block_ids, list):
             raise TypeError("block_ids must be a list.")
@@ -155,7 +232,6 @@ class KVcacheManager:
             raise ValueError("request_cycle must be greater than or equal to 0.")
 
         seen_block_ids = set()
-        seen_allocate_ids = set()
 
         for block_id in block_ids:
             if block_id is None or (isinstance(block_id, str) and not block_id.strip()):
@@ -171,52 +247,6 @@ class KVcacheManager:
                 raise ValueError(f"block_id({block_id}) does not exist.")
 
             seen_block_ids.add(block_id)
-            block = self.kv_cache_blocks[block_id]
-
-            # Validate Manager ownership and index consistency.
-            if block.block_id != block_id:
-                raise RuntimeError(f"block_id({block_id}) does not match its block record.")
-            if block.chip_id != self.chip_id:
-                raise RuntimeError(f"block_id({block_id}) does not belong to this chip.")
-            if block_id not in self.request_blocks.get(block.request_id, set()):
-                raise RuntimeError(f"block_id({block_id}) is missing from request_blocks.")
-
-            request_layer_key = (block.request_id, block.layer_id)
-            if block_id not in self.request_layer_blocks.get(request_layer_key, []):
-                raise RuntimeError(f"block_id({block_id}) is missing from request_layer_blocks.")
-
-            # Validate placement metadata and the corresponding allocation.
-            if block.storage_location not in ("attention_buffer", "hbm"):
-                raise RuntimeError(f"block_id({block_id}) has an invalid storage_location.")
-            if block.allocate_id is None:
-                raise RuntimeError(f"block_id({block_id}) does not have an allocate_id.")
-            try:
-                hash(block.allocate_id)
-            except TypeError as exc:
-                raise RuntimeError(f"allocate_id of block_id({block_id}) must be hashable.") from exc
-            if block.allocate_id in seen_allocate_ids:
-                raise RuntimeError(f"allocate_id({block.allocate_id}) is shared by multiple blocks.")
-
-            seen_allocate_ids.add(block.allocate_id)
-            if block.storage_location == "attention_buffer":
-                target_memory = self.attention_buffer
-                other_memory = self.hbm
-            else:
-                target_memory = self.hbm
-                other_memory = self.attention_buffer
-
-            if block.allocate_id not in target_memory.allocate_info:
-                raise RuntimeError(
-                    f"allocate_id({block.allocate_id}) of block_id"
-                    f"({block_id}) does not exist in its target memory."
-                )
-            if block.allocate_id in other_memory.allocate_info:
-                raise RuntimeError(
-                    f"allocate_id({block.allocate_id}) of block_id"
-                    f"({block_id}) exists in both memories."
-                )
-            if "ready_cycle" not in target_memory.allocate_info[block.allocate_id]:
-                raise RuntimeError(f"block_id({block_id}) has not completed its write.")
 
         # Memory grouping and read operations
         allocate_ids_attention_buffer = []
