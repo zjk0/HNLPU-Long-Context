@@ -289,7 +289,54 @@ class KVcacheManager:
         }
 
     def free_kv_block(self, block_id):
-        pass
+        self.ensure_consistent()
+
+        if block_id not in self.kv_cache_blocks:
+            raise ValueError(f"block_id({block_id}) does not exist.")
+
+        block = self.kv_cache_blocks[block_id]
+        if block_id not in self.request_blocks.get(block.request_id, set()):
+            raise RuntimeError(f"block_id({block_id}) is missing from request_blocks.")
+        if block_id not in self.request_layer_blocks.get((block.request_id, block.layer_id), []):
+            raise RuntimeError(f"block_id({block_id}) is missing from request_layer_blocks.")
+
+        if block.storage_location == "attention_buffer":
+            free_status = self.attention_buffer.free_memory(block.allocate_id)
+        elif block.storage_location == "hbm":
+            free_status = self.hbm.free_memory(block.allocate_id)
+        else:
+            return False
+
+        if free_status == False:
+            return False
+        else:
+            self.kv_cache_blocks.pop(block_id, None)
+
+            request_block_ids = self.request_blocks[block.request_id]
+            request_block_ids.discard(block_id)
+            if not request_block_ids:
+                self.request_blocks.pop(block.request_id)
+
+            request_layer_key = (block.request_id, block.layer_id)
+            layer_block_ids = self.request_layer_blocks[request_layer_key]
+            layer_block_ids.remove(block_id)
+            if not layer_block_ids:
+                self.request_layer_blocks.pop(request_layer_key)
+
+        self.ensure_consistent()
+        return True
 
     def free_request(self, request_id):
-        pass
+        self.ensure_consistent()
+
+        if request_id not in self.request_blocks:
+            raise ValueError(f"request_id({request_id}) does not exist.")
+
+        # Copy the IDs because free_kv_block() updates request_blocks.
+        block_ids = list(self.request_blocks[request_id])
+        for block_id in block_ids:
+            if self.free_kv_block(block_id) is False:
+                return False
+
+        self.ensure_consistent()
+        return True
