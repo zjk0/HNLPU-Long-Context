@@ -340,3 +340,284 @@ class KVcacheManager:
 
         self.ensure_consistent()
         return True
+
+
+if __name__ == "__main__":
+    from pprint import pprint
+
+    def make_block(
+        name,
+        request_id,
+        layer_id,
+        first_token_position,
+        num_tokens,
+        size_byte,
+        chip_id,
+    ):
+        return KVcacheBlock(
+            block_id = f"{name}-{uuid.uuid4().hex[:8]}",
+            request_id = request_id,
+            layer_id = layer_id,
+            first_token_position = first_token_position,
+            num_tokens = num_tokens,
+            size_byte = size_byte,
+            chip_id = chip_id,
+        )
+
+    def print_manager_state(manager, stage):
+        print(f"\n[{stage}]")
+        pprint(
+            {
+                "attention_buffer_usage_byte": manager.attention_buffer.usage_byte,
+                "hbm_usage_byte": manager.hbm.usage_byte,
+                "kv_cache_blocks": {
+                    block_id: block.storage_location
+                    for block_id, block in manager.kv_cache_blocks.items()
+                },
+                "request_blocks": manager.request_blocks,
+                "request_layer_blocks": manager.request_layer_blocks,
+            }
+        )
+
+    def assert_read_result(
+        read_result,
+        expected_size_byte,
+        uses_attention_buffer,
+        uses_hbm,
+    ):
+        assert read_result["total_read_size_byte"] == expected_size_byte
+        assert (read_result["attention_buffer_result"] is not None) == uses_attention_buffer
+        assert (read_result["hbm_result"] is not None) == uses_hbm
+        assert read_result["start_cycle"] >= read_result["request_cycle"]
+        assert read_result["finish_cycle"] >= read_result["start_cycle"]
+        assert (
+            read_result["total_latency_cycles"]
+            == read_result["finish_cycle"] - read_result["request_cycle"]
+        )
+
+    def run_small_capacity_test():
+        print("\n=== Small-capacity KVcacheManager test ===")
+
+        chip_id = "small-chip"
+        request_id = "small-request"
+        attention_buffer = AttentionBuffer(
+            num_banks = 4,
+            bank_size_byte = 4,
+            banks_per_group = 2,
+            access_width_bit = 32,
+            access_latency_cycles = 3,
+            clock_frequency_hz = 1_000_000_000,
+            check_consistency = True,
+        )
+        hbm = HBM(
+            num_stacks = 1,
+            stack_size_byte = 4,
+            bandwidth_byte_per_s = 4_000_000_000,
+            fixed_access_latency_s = 2e-9,
+            clock_frequency_hz = 1_000_000_000,
+            check_consistency = True,
+        )
+        manager = KVcacheManager(
+            chip_id,
+            attention_buffer,
+            hbm,
+            check_consistency = True,
+        )
+
+        assert manager.check_consistency()
+        manager.ensure_consistent()
+
+        attention_block_0 = make_block(
+            "small-ab-0", request_id, 0, 0, 1, 8, chip_id
+        )
+        attention_block_1 = make_block(
+            "small-ab-1", request_id, 1, 0, 1, 8, chip_id
+        )
+        hbm_block = make_block(
+            "small-hbm", request_id, 0, 1, 1, 4, chip_id
+        )
+
+        assert manager.store_kv_block(attention_block_0, request_cycle = 0)
+        assert manager.store_kv_block(attention_block_1, request_cycle = 1)
+        assert attention_buffer.is_full()
+        assert manager.store_kv_block(hbm_block, request_cycle = 2)
+
+        assert attention_block_0.storage_location == "attention_buffer"
+        assert attention_block_1.storage_location == "attention_buffer"
+        assert hbm_block.storage_location == "hbm"
+        assert attention_buffer.usage_byte == attention_buffer.size_byte
+        assert hbm.usage_byte == hbm.size_byte
+        assert manager.check_consistency()
+        print_manager_state(manager, "small capacity after stores")
+
+        rejected_block = make_block(
+            "small-rejected", request_id, 2, 0, 1, 4, chip_id
+        )
+        assert manager.store_kv_block(rejected_block, request_cycle = 3) is False
+        assert rejected_block.block_id not in manager.kv_cache_blocks
+        assert rejected_block.storage_location is None
+        assert rejected_block.allocate_id is None
+
+        attention_only_result = manager.read_kv_blocks(
+            [attention_block_0.block_id, attention_block_1.block_id],
+            request_cycle = 10,
+        )
+        assert_read_result(
+            attention_only_result,
+            expected_size_byte = 16,
+            uses_attention_buffer = True,
+            uses_hbm = False,
+        )
+
+        hbm_only_result = manager.read_kv_blocks(
+            [hbm_block.block_id],
+            request_cycle = 20,
+        )
+        assert_read_result(
+            hbm_only_result,
+            expected_size_byte = 4,
+            uses_attention_buffer = False,
+            uses_hbm = True,
+        )
+
+        mixed_result = manager.read_kv_blocks(
+            [attention_block_1.block_id, hbm_block.block_id],
+            request_cycle = 30,
+        )
+        assert_read_result(
+            mixed_result,
+            expected_size_byte = 12,
+            uses_attention_buffer = True,
+            uses_hbm = True,
+        )
+        print("\nAttention Buffer-only read result:")
+        pprint(attention_only_result)
+        print("\nHBM-only read result:")
+        pprint(hbm_only_result)
+        print("\nMixed read result:")
+        pprint(mixed_result)
+
+        manager.request_blocks[request_id].remove(attention_block_0.block_id)
+        assert manager.check_consistency() is False
+        try:
+            manager.ensure_consistent()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("ensure_consistent() did not detect an invalid index.")
+        manager.request_blocks[request_id].add(attention_block_0.block_id)
+        manager.ensure_consistent()
+
+        assert manager.free_kv_block(attention_block_0.block_id)
+        assert attention_block_0.block_id not in manager.kv_cache_blocks
+        assert attention_buffer.usage_byte == 8
+        assert manager.check_consistency()
+
+        assert manager.free_request(request_id)
+        assert manager.kv_cache_blocks == {}
+        assert manager.request_blocks == {}
+        assert manager.request_layer_blocks == {}
+        assert attention_buffer.is_empty()
+        assert hbm.is_empty()
+        manager.ensure_consistent()
+        print_manager_state(manager, "small capacity after frees")
+        print("[PASS] Small-capacity KVcacheManager test")
+
+    def run_large_capacity_test():
+        print("\n=== Large-capacity KVcacheManager test ===")
+
+        chip_id = "large-chip"
+        request_id_0 = "large-request-0"
+        request_id_1 = "large-request-1"
+        attention_buffer = AttentionBuffer(check_consistency = True)
+        hbm = HBM(check_consistency = True)
+        manager = KVcacheManager(
+            chip_id,
+            attention_buffer,
+            hbm,
+            check_consistency = True,
+        )
+
+        block_size_byte = attention_buffer.bank_group_size_byte
+        blocks = [
+            make_block(
+                "large-0",
+                request_id_0,
+                0,
+                0,
+                128,
+                block_size_byte,
+                chip_id,
+            ),
+            make_block(
+                "large-1",
+                request_id_0,
+                1,
+                0,
+                128,
+                block_size_byte,
+                chip_id,
+            ),
+            make_block(
+                "large-2",
+                request_id_1,
+                0,
+                128,
+                128,
+                block_size_byte,
+                chip_id,
+            ),
+        ]
+
+        for request_cycle, block in enumerate(blocks):
+            assert manager.store_kv_block(block, request_cycle)
+            assert block.storage_location == "attention_buffer"
+
+        assert attention_buffer.usage_byte == block_size_byte * len(blocks)
+        assert hbm.is_empty()
+        assert manager.check_consistency()
+        manager.ensure_consistent()
+        print_manager_state(manager, "large capacity after stores")
+
+        read_result = manager.read_kv_blocks(
+            [block.block_id for block in blocks],
+            request_cycle = 100_000,
+        )
+        assert_read_result(
+            read_result,
+            expected_size_byte = block_size_byte * len(blocks),
+            uses_attention_buffer = True,
+            uses_hbm = False,
+        )
+        print("\nLarge-capacity read result:")
+        pprint(
+            {
+                "request_cycle": read_result["request_cycle"],
+                "start_cycle": read_result["start_cycle"],
+                "finish_cycle": read_result["finish_cycle"],
+                "total_latency_cycles": read_result["total_latency_cycles"],
+                "total_read_size_byte": read_result["total_read_size_byte"],
+            }
+        )
+
+        assert manager.free_request(request_id_0)
+        assert request_id_0 not in manager.request_blocks
+        assert blocks[2].block_id in manager.kv_cache_blocks
+        assert attention_buffer.usage_byte == block_size_byte
+
+        assert manager.free_request(request_id_1)
+        assert manager.kv_cache_blocks == {}
+        assert attention_buffer.is_empty()
+        assert hbm.is_empty()
+        manager.ensure_consistent()
+        print_manager_state(manager, "large capacity after frees")
+        print("[PASS] Large-capacity KVcacheManager test")
+
+    try:
+        run_small_capacity_test()
+        run_large_capacity_test()
+    except Exception as exc:
+        print(f"\n[FAIL] KVcacheManager test: {exc}")
+        raise
+
+    print("\n[PASS] All KVcacheManager tests passed")
