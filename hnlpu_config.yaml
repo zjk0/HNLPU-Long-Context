@@ -20,6 +20,7 @@ hnlpu:
   max_batch_size: 216
   clock_GHz: 1.0
   vex_cached_kv_heads_per_cycle_per_chip: 32
+  hn_array_fixed_latency_cycles: 10  # assumed: 论文未给出HN Array单任务固定周期；第一版沿用粗粒度10-cycle模型。
   reported_throughput_tokens_per_s_at_2k: 249960
   calibration_context_length: 2048
   calibration_batch_size: 216
