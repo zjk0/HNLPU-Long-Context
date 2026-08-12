@@ -3,7 +3,7 @@ from pathlib import Path
 import yaml
 
 class Config:
-    def __init__(self, yaml_path):
+    def __init__(self, yaml_path, overrides = None):
         if not isinstance(yaml_path, (str, PathLike)):
             raise TypeError("yaml_path must be a path-like object.")
         if isinstance(yaml_path, str) and not yaml_path.strip():
@@ -23,6 +23,26 @@ class Config:
 
         if not isinstance(config_data, dict):
             raise ValueError("The YAML root must be a mapping.")
+
+        if overrides is not None:
+            if not isinstance(overrides, dict):
+                raise TypeError("overrides must be a dictionary or None.")
+
+            for section_name, section_overrides in overrides.items():
+                if section_name not in config_data:
+                    raise KeyError(
+                        f"Override section does not exist in the YAML: {section_name}"
+                    )
+                if not isinstance(section_overrides, dict):
+                    raise TypeError(
+                        f"Override section '{section_name}' must be a dictionary."
+                    )
+                if not isinstance(config_data[section_name], dict):
+                    raise TypeError(
+                        f"Configuration section '{section_name}' must be a mapping."
+                    )
+
+                config_data[section_name].update(section_overrides)
 
         required_keys = {
             "model": (
