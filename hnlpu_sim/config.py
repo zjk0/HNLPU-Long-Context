@@ -150,7 +150,6 @@ class Config:
                 "calibration_batch_size",
             ),
             "memory": (
-                "attention_buffer_mb_per_chip",
                 "attention_buffer_banks_per_chip",
                 "attention_buffer_bank_kb",
                 "attention_buffer_latency_cycles",
@@ -169,7 +168,10 @@ class Config:
 
         positive_number_fields = {
             "hnlpu": ("clock_GHz",),
-            "memory": ("attention_buffer_bandwidth_TBps_per_chip",),
+            "memory": (
+                "attention_buffer_mb_per_chip",
+                "attention_buffer_bandwidth_TBps_per_chip",
+            ),
             "interconnect": (
                 "cxl_bandwidth_GBps_per_link",
                 "cxl_latency_ns",
