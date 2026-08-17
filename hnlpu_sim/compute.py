@@ -150,6 +150,74 @@ class HNArray:
         }
 
 
+class HNUnit:
+    def __init__(
+        self,
+        layer_id,
+        weight_type,
+        fixed_latency_cycles,
+        expert_id = None,
+    ):
+        if not isinstance(layer_id, int) or isinstance(layer_id, bool):
+            raise TypeError("layer_id must be an integer.")
+        if layer_id < 0:
+            raise ValueError("layer_id must be greater than or equal to 0.")
+
+        if not isinstance(weight_type, str):
+            raise TypeError("weight_type must be a string.")
+        if not weight_type.strip():
+            raise ValueError("weight_type must not be empty.")
+
+        if (
+            not isinstance(fixed_latency_cycles, int)
+            or isinstance(fixed_latency_cycles, bool)
+        ):
+            raise TypeError("fixed_latency_cycles must be an integer.")
+        if fixed_latency_cycles <= 0:
+            raise ValueError("fixed_latency_cycles must be greater than 0.")
+
+        if expert_id is not None:
+            if not isinstance(expert_id, int) or isinstance(expert_id, bool):
+                raise TypeError("expert_id must be an integer or None.")
+            if expert_id < 0:
+                raise ValueError("expert_id must be greater than or equal to 0.")
+
+        self.layer_id = layer_id
+        self.weight_type = weight_type
+        self.fixed_latency_cycles = fixed_latency_cycles
+        self.expert_id = expert_id
+        self.busy_until_cycle = 0
+
+    def execute(self, task, request_cycle):
+        if not isinstance(task, ComputeTask):
+            raise TypeError("task must be a ComputeTask.")
+        if not isinstance(request_cycle, int) or isinstance(request_cycle, bool):
+            raise TypeError("request_cycle must be an integer.")
+        if request_cycle < 0:
+            raise ValueError("request_cycle must be greater than or equal to 0.")
+
+        service_cycles = self.fixed_latency_cycles
+        start_cycle = max(request_cycle, self.busy_until_cycle)
+        wait_cycles = start_cycle - request_cycle
+        finish_cycle = start_cycle + service_cycles
+        total_latency_cycles = finish_cycle - request_cycle
+
+        self.busy_until_cycle = finish_cycle
+
+        return {
+            "request_cycle": request_cycle,
+            "start_cycle": start_cycle,
+            "finish_cycle": finish_cycle,
+            "wait_cycles": wait_cycles,
+            "service_cycles": service_cycles,
+            "total_latency_cycles": total_latency_cycles,
+            "compute_workload": task.workload.copy(),
+            "layer_id": self.layer_id,
+            "weight_type": self.weight_type,
+            "expert_id": self.expert_id,
+        }
+
+
 if __name__ == "__main__":
     vex = VEX()
     attention_task = ComputeTask(
@@ -247,3 +315,50 @@ if __name__ == "__main__":
     assert hn_array.busy_until_cycle == busy_until_cycle_before
 
     print("VEX and HNArray tests passed.")
+
+    first_hn_unit = HNUnit(
+        layer_id = 0,
+        weight_type = "qkv_projection",
+        fixed_latency_cycles = 7,
+    )
+    second_hn_unit = HNUnit(
+        layer_id = 1,
+        weight_type = "expert_up_projection",
+        fixed_latency_cycles = 11,
+        expert_id = 3,
+    )
+    hn_unit_task = ComputeTask(
+        request_id = "request-0",
+        task_type = "projection",
+        workload = {"num_tokens": 1},
+    )
+
+    first_unit_result = first_hn_unit.execute(
+        hn_unit_task,
+        request_cycle = 5,
+    )
+    second_unit_result = second_hn_unit.execute(
+        hn_unit_task,
+        request_cycle = 5,
+    )
+
+    assert first_unit_result["start_cycle"] == 5
+    assert second_unit_result["start_cycle"] == 5
+    assert first_unit_result["finish_cycle"] == 12
+    assert second_unit_result["finish_cycle"] == 16
+    assert first_unit_result["layer_id"] == 0
+    assert first_unit_result["weight_type"] == "qkv_projection"
+    assert first_unit_result["expert_id"] is None
+    assert second_unit_result["expert_id"] == 3
+
+    queued_unit_result = first_hn_unit.execute(
+        hn_unit_task,
+        request_cycle = 5,
+    )
+    assert queued_unit_result["start_cycle"] == first_unit_result["finish_cycle"]
+    assert queued_unit_result["wait_cycles"] == 7
+    assert queued_unit_result["finish_cycle"] == 19
+    assert first_hn_unit.busy_until_cycle == 19
+    assert second_hn_unit.busy_until_cycle == 16
+
+    print("HNUnit tests passed.")
