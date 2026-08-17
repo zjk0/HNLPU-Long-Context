@@ -104,50 +104,111 @@ class VEX:
             },
         }
 
-# HNArray executes operations involving fixed pretrained weights. The current
-# simulator uses a coarse fixed latency and does not model HN microarchitecture.
 class HNArray:
-    def __init__(self, fixed_latency_cycles):
-        if (
-            not isinstance(fixed_latency_cycles, int)
-            or isinstance(fixed_latency_cycles, bool)
-        ):
-            raise TypeError("fixed_latency_cycles must be an integer.")
-        if fixed_latency_cycles <= 0:
-            raise ValueError("fixed_latency_cycles must be greater than 0.")
+    NON_EXPERT_WEIGHT_TYPES = ("q", "k", "v", "xo", "router")
+    EXPERT_WEIGHT_TYPES = ("up", "gate", "down")
+    SUPPORTED_WEIGHT_TYPES = NON_EXPERT_WEIGHT_TYPES + EXPERT_WEIGHT_TYPES
 
-        self.fixed_latency_cycles = fixed_latency_cycles
-        self.busy_until_cycle = 0
+    def __init__(self, layer_num, expert_ids, weight_type_latency):
+        if not isinstance(layer_num, int) or isinstance(layer_num, bool):
+            raise TypeError("layer_num must be an integer.")
+        if layer_num <= 0:
+            raise ValueError("layer_num must be greater than 0.")
 
-    def execute(self, task, request_cycle):
-        if not isinstance(task, ComputeTask):
-            raise TypeError("task must be a ComputeTask.")
-        if not isinstance(request_cycle, int) or isinstance(request_cycle, bool):
-            raise TypeError("request_cycle must be an integer.")
-        if request_cycle < 0:
-            raise ValueError("request_cycle must be greater than or equal to 0.")
+        if not isinstance(expert_ids, list):
+            raise TypeError("expert_ids must be a list.")
+        for expert_id in expert_ids:
+            if not isinstance(expert_id, int) or isinstance(expert_id, bool):
+                raise TypeError("Every expert_id must be an integer.")
+            if expert_id < 0:
+                raise ValueError("Every expert_id must be greater than or equal to 0.")
+        if len(set(expert_ids)) != len(expert_ids):
+            raise ValueError("expert_ids must not contain duplicates.")
 
-        if task.task_type not in ("projection", "unembedding"):
-            raise ValueError(f"HNArray does not support task_type({task.task_type}).")
+        if not isinstance(weight_type_latency, dict):
+            raise TypeError("weight_type_latency must be a dictionary.")
+        missing_weight_types = [
+            weight_type
+            for weight_type in self.SUPPORTED_WEIGHT_TYPES
+            if weight_type not in weight_type_latency
+        ]
+        if missing_weight_types:
+            raise KeyError(
+                "weight_type_latency is missing weight types: "
+                + ", ".join(missing_weight_types)
+            )
 
-        # Simulator-level coarse model, not a physical latency from the paper.
-        service_cycles = self.fixed_latency_cycles
-        start_cycle = max(request_cycle, self.busy_until_cycle)
-        wait_cycles = start_cycle - request_cycle
-        finish_cycle = start_cycle + service_cycles
-        total_latency_cycles = finish_cycle - request_cycle
+        for weight_type in self.SUPPORTED_WEIGHT_TYPES:
+            latency = weight_type_latency[weight_type]
+            if not isinstance(latency, int) or isinstance(latency, bool):
+                raise TypeError(f"weight_type_latency[{weight_type!r}] must be an integer.")
+            if latency <= 0:
+                raise ValueError(f"weight_type_latency[{weight_type!r}] must be greater than 0.")
 
-        self.busy_until_cycle = finish_cycle
+        self.layer_num = layer_num
+        self.expert_ids = expert_ids.copy()
+        self.weight_type_latency = weight_type_latency.copy()
+        self.units = {}
 
-        return {
-            "request_cycle": request_cycle,
-            "start_cycle": start_cycle,
-            "finish_cycle": finish_cycle,
-            "wait_cycles": wait_cycles,
-            "service_cycles": service_cycles,
-            "total_latency_cycles": total_latency_cycles,
-            "compute_workload": task.workload.copy(),
-        }
+        for layer_id in range(layer_num):
+            for weight_type in self.NON_EXPERT_WEIGHT_TYPES:
+                unit_key = (layer_id, weight_type, None)
+                self.units[unit_key] = HNUnit(
+                    layer_id = layer_id,
+                    weight_type = weight_type,
+                    fixed_latency_cycles = weight_type_latency[weight_type],
+                )
+
+            for weight_type in self.EXPERT_WEIGHT_TYPES:
+                for expert_id in expert_ids:
+                    unit_key = (layer_id, weight_type, expert_id)
+                    self.units[unit_key] = HNUnit(
+                        layer_id = layer_id,
+                        weight_type = weight_type,
+                        fixed_latency_cycles = weight_type_latency[weight_type],
+                        expert_id = expert_id,
+                    )
+
+    def execute(
+        self,
+        task,
+        layer_id,
+        weight_type,
+        request_cycle,
+        expert_id = None,
+    ):
+        if not isinstance(layer_id, int) or isinstance(layer_id, bool):
+            raise TypeError("layer_id must be an integer.")
+        if not 0 <= layer_id < self.layer_num:
+            raise ValueError(
+                f"layer_id must be between 0 and {self.layer_num - 1}."
+            )
+
+        if not isinstance(weight_type, str):
+            raise TypeError("weight_type must be a string.")
+        if not weight_type.strip():
+            raise ValueError("weight_type must not be empty.")
+        if weight_type not in self.SUPPORTED_WEIGHT_TYPES:
+            raise ValueError(f"HNArray does not support weight_type({weight_type}).")
+
+        if expert_id is not None:
+            if not isinstance(expert_id, int) or isinstance(expert_id, bool):
+                raise TypeError("expert_id must be an integer or None.")
+            if expert_id < 0:
+                raise ValueError("expert_id must be greater than or equal to 0.")
+
+        if weight_type in self.NON_EXPERT_WEIGHT_TYPES and expert_id is not None:
+            raise ValueError(
+                f"weight_type({weight_type}) requires expert_id to be None."
+            )
+        if weight_type in self.EXPERT_WEIGHT_TYPES and expert_id is None:
+            raise ValueError(f"weight_type({weight_type}) requires an expert_id.")
+
+        unit_key = (layer_id, weight_type, expert_id)
+        if unit_key not in self.units:
+            raise KeyError(f"HNUnit does not exist for key {unit_key}.")
+
+        return self.units[unit_key].execute(task, request_cycle)
 
 
 class HNUnit:
@@ -274,45 +335,84 @@ if __name__ == "__main__":
                 f"VEX did not reject unsupported task_type({task_type})."
             )
 
-    hn_array = HNArray(fixed_latency_cycles = 10)
+    weight_type_latency = {
+        "q": 7,
+        "k": 8,
+        "v": 9,
+        "xo": 10,
+        "router": 11,
+        "up": 12,
+        "gate": 13,
+        "down": 14,
+    }
+    hn_array = HNArray(
+        layer_num = 2,
+        expert_ids = [3, 7],
+        weight_type_latency = weight_type_latency,
+    )
+    assert len(hn_array.units) == 2 * (5 + 3 * 2)
+    assert (0, "q", None) in hn_array.units
+    assert (0, "up", 3) in hn_array.units
+
     projection_task = ComputeTask(
         request_id = "request-0",
         task_type = "projection",
-        workload = {"num_tokens": 32},
-    )
-    projection_result = hn_array.execute(projection_task, request_cycle = 5)
-
-    assert projection_result["start_cycle"] == 5
-    assert projection_result["service_cycles"] == 10
-    assert projection_result["finish_cycle"] == 15
-
-    unembedding_task = ComputeTask(
-        request_id = "request-0",
-        task_type = "unembedding",
         workload = {"num_tokens": 1},
     )
-    unembedding_result = hn_array.execute(
-        unembedding_task,
-        request_cycle = 6,
-    )
-    assert unembedding_result["start_cycle"] == projection_result["finish_cycle"]
-    assert unembedding_result["wait_cycles"] == 9
-    assert unembedding_result["service_cycles"] == 10
-    assert unembedding_result["finish_cycle"] == 25
 
-    moe_task = ComputeTask(
-        request_id = "request-0",
-        task_type = "moe",
-        workload = {},
+    layer_0_q_result = hn_array.execute(
+        projection_task,
+        layer_id = 0,
+        weight_type = "q",
+        request_cycle = 5,
     )
-    busy_until_cycle_before = hn_array.busy_until_cycle
-    try:
-        hn_array.execute(moe_task, request_cycle = 0)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("HNArray did not reject task_type(moe).")
-    assert hn_array.busy_until_cycle == busy_until_cycle_before
+    layer_1_q_result = hn_array.execute(
+        projection_task,
+        layer_id = 1,
+        weight_type = "q",
+        request_cycle = 5,
+    )
+    layer_0_k_result = hn_array.execute(
+        projection_task,
+        layer_id = 0,
+        weight_type = "k",
+        request_cycle = 5,
+    )
+
+    assert layer_0_q_result["start_cycle"] == 5
+    assert layer_1_q_result["start_cycle"] == 5
+    assert layer_0_k_result["start_cycle"] == 5
+    assert layer_0_q_result["layer_id"] == 0
+    assert layer_1_q_result["layer_id"] == 1
+    assert layer_0_k_result["weight_type"] == "k"
+
+    queued_q_result = hn_array.execute(
+        projection_task,
+        layer_id = 0,
+        weight_type = "q",
+        request_cycle = 5,
+    )
+    assert queued_q_result["start_cycle"] == layer_0_q_result["finish_cycle"]
+    assert queued_q_result["wait_cycles"] == 7
+
+    expert_3_result = hn_array.execute(
+        projection_task,
+        layer_id = 0,
+        weight_type = "up",
+        expert_id = 3,
+        request_cycle = 5,
+    )
+    expert_7_result = hn_array.execute(
+        projection_task,
+        layer_id = 0,
+        weight_type = "up",
+        expert_id = 7,
+        request_cycle = 5,
+    )
+    assert expert_3_result["start_cycle"] == 5
+    assert expert_7_result["start_cycle"] == 5
+    assert expert_3_result["expert_id"] == 3
+    assert expert_7_result["expert_id"] == 7
 
     print("VEX and HNArray tests passed.")
 
