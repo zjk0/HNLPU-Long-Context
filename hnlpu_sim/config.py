@@ -67,7 +67,7 @@ class Config:
                 "max_batch_size",
                 "clock_GHz",
                 "vex_cached_kv_heads_per_cycle_per_chip",
-                "hn_array_fixed_latency_cycles",
+                "hn_array_latency_cycles",
                 "reported_throughput_tokens_per_s_at_2k",
                 "calibration_context_length",
                 "calibration_batch_size",
@@ -123,6 +123,43 @@ class Config:
             missing_keys_text = ", ".join(missing_context_keys)
             raise KeyError(f"Missing keys in eval.context_lengths: {missing_keys_text}")
 
+        hn_array_latency_cycles = config_data["hnlpu"]["hn_array_latency_cycles"]
+        if not isinstance(hn_array_latency_cycles, dict):
+            raise TypeError("hnlpu.hn_array_latency_cycles must be a mapping.")
+        hn_array_weight_types = (
+            "q",
+            "k",
+            "v",
+            "xo",
+            "router",
+            "up",
+            "gate",
+            "down",
+        )
+        missing_weight_types = [
+            weight_type
+            for weight_type in hn_array_weight_types
+            if weight_type not in hn_array_latency_cycles
+        ]
+        if missing_weight_types:
+            missing_weight_types_text = ", ".join(missing_weight_types)
+            raise KeyError(
+                "Missing keys in hnlpu.hn_array_latency_cycles: "
+                f"{missing_weight_types_text}"
+            )
+        for weight_type in hn_array_weight_types:
+            latency_cycles = hn_array_latency_cycles[weight_type]
+            if not isinstance(latency_cycles, int) or isinstance(latency_cycles, bool):
+                raise TypeError(
+                    "hnlpu.hn_array_latency_cycles."
+                    f"{weight_type} must be an integer."
+                )
+            if latency_cycles <= 0:
+                raise ValueError(
+                    "hnlpu.hn_array_latency_cycles."
+                    f"{weight_type} must be greater than 0."
+                )
+
         integer_fields = {
             "model": (
                 "num_layers",
@@ -144,7 +181,6 @@ class Config:
                 "pipeline_slots",
                 "max_batch_size",
                 "vex_cached_kv_heads_per_cycle_per_chip",
-                "hn_array_fixed_latency_cycles",
                 "reported_throughput_tokens_per_s_at_2k",
                 "calibration_context_length",
                 "calibration_batch_size",
@@ -238,6 +274,10 @@ class Config:
             raise ValueError("model.num_weight_values must equal 2 ** model.weight_bits.")
         if hnlpu["chip_grid_rows"] * hnlpu["chip_grid_cols"] != hnlpu["num_chips"]:
             raise ValueError("hnlpu chip grid dimensions must match hnlpu.num_chips.")
+        if model["num_experts"] % hnlpu["num_chips"] != 0:
+            raise ValueError(
+                "model.num_experts must be divisible by hnlpu.num_chips."
+            )
         if hnlpu["pipeline_slots"] != model["num_layers"] * hnlpu["stages_per_layer"]:
             raise ValueError(
                 "hnlpu.pipeline_slots must equal model.num_layers multiplied by "
