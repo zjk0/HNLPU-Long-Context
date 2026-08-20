@@ -72,6 +72,12 @@ class Config:
                 "calibration_context_length",
                 "calibration_batch_size",
             ),
+            "vex": (
+                "swiglu_latency_cycles",
+                "rmsnorm_latency_cycles",
+                "residual_latency_cycles",
+                "sampling_latency_cycles",
+            ),
             "memory": (
                 "attention_buffer_mb_per_chip",
                 "attention_buffer_banks_per_chip",
@@ -184,6 +190,12 @@ class Config:
                 "reported_throughput_tokens_per_s_at_2k",
                 "calibration_context_length",
                 "calibration_batch_size",
+            ),
+            "vex": (
+                "swiglu_latency_cycles",
+                "rmsnorm_latency_cycles",
+                "residual_latency_cycles",
+                "sampling_latency_cycles",
             ),
             "memory": (
                 "attention_buffer_banks_per_chip",
@@ -299,6 +311,7 @@ class Config:
         self.data = config_data
         self.model = model
         self.hnlpu = hnlpu
+        self.vex = config_data["vex"]
         self.memory = memory
         self.interconnect = config_data["interconnect"]
         self.eval = config_data["eval"]

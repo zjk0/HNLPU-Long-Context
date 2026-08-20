@@ -54,11 +54,14 @@ class ComputeTask:
         # Identifies the MoE expert associated with expert-specific computation.
         self.expert_id = expert_id
 
-# The physical VEX also handles RMSNorm, SwiGLU, softmax, residual
-# addition, and sampling. Only attention has a timing model here because
-# the paper does not provide cycle-level parameters for the other operations.
+# Attention uses a context-dependent workload model. Other modeled VEX
+# operations use configurable, context-independent fixed-latency approximations.
 class VEX:
-    def __init__(self, cached_kv_heads_per_cycle = 32):
+    def __init__(
+        self,
+        cached_kv_heads_per_cycle = 32,
+        fixed_latency_cycles = None,
+    ):
         if (
             not isinstance(cached_kv_heads_per_cycle, int)
             or isinstance(cached_kv_heads_per_cycle, bool)
@@ -67,7 +70,45 @@ class VEX:
         if cached_kv_heads_per_cycle <= 0:
             raise ValueError("cached_kv_heads_per_cycle must be greater than 0.")
 
+        if fixed_latency_cycles is not None:
+            if not isinstance(fixed_latency_cycles, dict):
+                raise TypeError("fixed_latency_cycles must be a dictionary or None.")
+
+            required_latency_fields = (
+                "swiglu_latency_cycles",
+                "rmsnorm_latency_cycles",
+                "residual_latency_cycles",
+                "sampling_latency_cycles",
+            )
+            missing_latency_fields = [
+                field_name
+                for field_name in required_latency_fields
+                if field_name not in fixed_latency_cycles
+            ]
+            if missing_latency_fields:
+                raise KeyError(
+                    "fixed_latency_cycles is missing fields: "
+                    + ", ".join(missing_latency_fields)
+                )
+
+            for field_name in required_latency_fields:
+                latency_cycles = fixed_latency_cycles[field_name]
+                if not isinstance(latency_cycles, int) or isinstance(
+                    latency_cycles,
+                    bool,
+                ):
+                    raise TypeError(
+                        f"fixed_latency_cycles[{field_name!r}] must be an integer."
+                    )
+                if latency_cycles <= 0:
+                    raise ValueError(
+                        f"fixed_latency_cycles[{field_name!r}] must be greater than 0."
+                    )
+
         self.cached_kv_heads_per_cycle = cached_kv_heads_per_cycle
+        self.fixed_latency_cycles = (
+            None if fixed_latency_cycles is None else fixed_latency_cycles.copy()
+        )
         self.busy_until_cycle = 0
 
     def execute(self, task, request_cycle):
@@ -78,43 +119,107 @@ class VEX:
         if request_cycle < 0:
             raise ValueError("request_cycle must be greater than or equal to 0.")
 
-        vex_task_types = (
-            "attention",
+        legacy_unmodeled_task_types = (
             "rmsnorm",
             "swiglu",
             "softmax",
+        )
+        if task.task_type in legacy_unmodeled_task_types:
+            raise NotImplementedError(
+                f"{task.task_type} is supported by the physical HNLPU VEX, "
+                "but this task_type does not have a timing model in the current "
+                "simulator."
+            )
+
+        vex_task_types = (
+            "attention",
+            "activation",
+            "normalization",
             "residual",
             "sampling",
         )
         if task.task_type not in vex_task_types:
             raise ValueError(f"VEX does not support task_type({task.task_type}).")
-        if task.task_type != "attention":
-            raise NotImplementedError(
-                f"{task.task_type} is supported by the physical HNLPU VEX, "
-                "but its timing model is not implemented in the current "
-                "simulator."
+
+        if task.task_type == "attention":
+            for field_name in ("q_length", "kv_length"):
+                if field_name not in task.workload:
+                    raise KeyError(f"attention workload must contain {field_name}.")
+
+                field_value = task.workload[field_name]
+                if not isinstance(field_value, int) or isinstance(field_value, bool):
+                    raise TypeError(
+                        f"attention workload {field_name} must be an integer."
+                    )
+                if field_value <= 0:
+                    raise ValueError(
+                        f"attention workload {field_name} must be greater than 0."
+                    )
+
+            q_length = task.workload["q_length"]
+            kv_length = task.workload["kv_length"]
+
+            # First-version equivalent attention workload model. This value is
+            # not the physical cached KV-head count defined by the paper.
+            equivalent_cached_kv_head_work = q_length * kv_length
+            service_cycles = max(
+                1,
+                (
+                    equivalent_cached_kv_head_work
+                    + self.cached_kv_heads_per_cycle
+                    - 1
+                )
+                // self.cached_kv_heads_per_cycle,
             )
+            compute_workload = {
+                "q_length": q_length,
+                "kv_length": kv_length,
+                "equivalent_cached_kv_head_work": equivalent_cached_kv_head_work,
+            }
+        else:
+            if self.fixed_latency_cycles is None:
+                raise NotImplementedError(
+                    f"{task.task_type} belongs to the HNLPU VEX, but its fixed "
+                    "latency configuration was not provided."
+                )
 
-        for field_name in ("q_length", "kv_length"):
-            if field_name not in task.workload:
-                raise KeyError(f"attention workload must contain {field_name}.")
+            if task.task_type == "activation":
+                if "op_type" not in task.workload:
+                    raise KeyError("activation workload must contain op_type.")
+                op_type = task.workload["op_type"]
+                if not isinstance(op_type, str):
+                    raise TypeError("activation workload op_type must be a string.")
+                if not op_type.strip():
+                    raise ValueError("activation workload op_type must not be empty.")
+                if op_type != "swiglu":
+                    raise ValueError(
+                        f"VEX does not support activation op_type({op_type})."
+                    )
+                latency_field = "swiglu_latency_cycles"
+            elif task.task_type == "normalization":
+                if "op_type" not in task.workload:
+                    raise KeyError("normalization workload must contain op_type.")
+                op_type = task.workload["op_type"]
+                if not isinstance(op_type, str):
+                    raise TypeError(
+                        "normalization workload op_type must be a string."
+                    )
+                if not op_type.strip():
+                    raise ValueError(
+                        "normalization workload op_type must not be empty."
+                    )
+                if op_type != "rmsnorm":
+                    raise ValueError(
+                        f"VEX does not support normalization op_type({op_type})."
+                    )
+                latency_field = "rmsnorm_latency_cycles"
+            elif task.task_type == "residual":
+                latency_field = "residual_latency_cycles"
+            else:
+                latency_field = "sampling_latency_cycles"
 
-            field_value = task.workload[field_name]
-            if not isinstance(field_value, int) or isinstance(field_value, bool):
-                raise TypeError(f"attention workload {field_name} must be an integer.")
-            if field_value <= 0:
-                raise ValueError(f"attention workload {field_name} must be greater than 0.")
-
-        q_length = task.workload["q_length"]
-        kv_length = task.workload["kv_length"]
-
-        # First-version equivalent attention workload model. This value is
-        # not the physical cached KV-head count defined by the paper.
-        equivalent_cached_kv_head_work = q_length * kv_length
-        service_cycles = max(
-            1, 
-            (equivalent_cached_kv_head_work + self.cached_kv_heads_per_cycle - 1) // self.cached_kv_heads_per_cycle
-        )
+            service_cycles = self.fixed_latency_cycles[latency_field]
+            compute_workload = task.workload.copy()
 
         start_cycle = max(request_cycle, self.busy_until_cycle)
         wait_cycles = start_cycle - request_cycle
@@ -130,11 +235,7 @@ class VEX:
             "wait_cycles": wait_cycles,
             "service_cycles": service_cycles,
             "total_latency_cycles": total_latency_cycles,
-            "compute_workload": {
-                "q_length": q_length,
-                "kv_length": kv_length,
-                "equivalent_cached_kv_head_work": equivalent_cached_kv_head_work,
-            },
+            "compute_workload": compute_workload,
         }
 
 class HNArray:

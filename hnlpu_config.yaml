@@ -33,6 +33,12 @@ hnlpu:
   calibration_context_length: 2048
   calibration_batch_size: 216
 
+vex:
+  swiglu_latency_cycles: 20
+  rmsnorm_latency_cycles: 10
+  residual_latency_cycles: 5
+  sampling_latency_cycles: 50
+
 memory:
   attention_buffer_mb_per_chip: 320
   attention_buffer_banks_per_chip: 20000
