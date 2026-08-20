@@ -44,7 +44,8 @@ class ComputeTask:
                 raise ValueError("expert_id must be greater than or equal to 0.")
 
         self.request_id = request_id
-        self.task_type = task_type
+        # Identifies the broad execution class, such as linear, attention, or vector.
+        self.task_type = "linear" if task_type == "projection" else task_type
         self.workload = workload.copy()
 
         # Identifies the Transformer layer that owns this task.
@@ -123,6 +124,8 @@ class VEX:
             "rmsnorm",
             "swiglu",
             "softmax",
+            "residual",
+            "sampling",
         )
         if task.task_type in legacy_unmodeled_task_types:
             raise NotImplementedError(
@@ -133,10 +136,7 @@ class VEX:
 
         vex_task_types = (
             "attention",
-            "activation",
-            "normalization",
-            "residual",
-            "sampling",
+            "vector",
         )
         if task.task_type not in vex_task_types:
             raise ValueError(f"VEX does not support task_type({task.task_type}).")
@@ -177,46 +177,35 @@ class VEX:
                 "equivalent_cached_kv_head_work": equivalent_cached_kv_head_work,
             }
         else:
-            if self.fixed_latency_cycles is None:
+            if "vector_op" not in task.workload:
+                raise KeyError("vector workload must contain vector_op.")
+            vector_op = task.workload["vector_op"]
+            if not isinstance(vector_op, str):
+                raise TypeError("vector workload vector_op must be a string.")
+            if not vector_op.strip():
+                raise ValueError("vector workload vector_op must not be empty.")
+
+            if vector_op == "softmax":
                 raise NotImplementedError(
-                    f"{task.task_type} belongs to the HNLPU VEX, but its fixed "
-                    "latency configuration was not provided."
+                    "softmax belongs to the HNLPU VEX, but its timing model "
+                    "is not configured in the current simulator."
                 )
 
-            if task.task_type == "activation":
-                if "op_type" not in task.workload:
-                    raise KeyError("activation workload must contain op_type.")
-                op_type = task.workload["op_type"]
-                if not isinstance(op_type, str):
-                    raise TypeError("activation workload op_type must be a string.")
-                if not op_type.strip():
-                    raise ValueError("activation workload op_type must not be empty.")
-                if op_type != "swiglu":
-                    raise ValueError(
-                        f"VEX does not support activation op_type({op_type})."
-                    )
-                latency_field = "swiglu_latency_cycles"
-            elif task.task_type == "normalization":
-                if "op_type" not in task.workload:
-                    raise KeyError("normalization workload must contain op_type.")
-                op_type = task.workload["op_type"]
-                if not isinstance(op_type, str):
-                    raise TypeError(
-                        "normalization workload op_type must be a string."
-                    )
-                if not op_type.strip():
-                    raise ValueError(
-                        "normalization workload op_type must not be empty."
-                    )
-                if op_type != "rmsnorm":
-                    raise ValueError(
-                        f"VEX does not support normalization op_type({op_type})."
-                    )
-                latency_field = "rmsnorm_latency_cycles"
-            elif task.task_type == "residual":
-                latency_field = "residual_latency_cycles"
-            else:
-                latency_field = "sampling_latency_cycles"
+            vector_op_latency_fields = {
+                "swiglu": "swiglu_latency_cycles",
+                "rmsnorm": "rmsnorm_latency_cycles",
+                "residual": "residual_latency_cycles",
+                "sampling": "sampling_latency_cycles",
+            }
+            if vector_op not in vector_op_latency_fields:
+                raise ValueError(f"VEX does not support vector_op({vector_op}).")
+            if self.fixed_latency_cycles is None:
+                raise NotImplementedError(
+                    f"vector_op({vector_op}) belongs to the HNLPU VEX, but its "
+                    "fixed latency configuration was not provided."
+                )
+
+            latency_field = vector_op_latency_fields[vector_op]
 
             service_cycles = self.fixed_latency_cycles[latency_field]
             compute_workload = task.workload.copy()
@@ -306,20 +295,40 @@ class HNArray:
     def execute(
         self,
         task,
-        layer_id,
-        weight_type,
         request_cycle,
+        layer_id = None,
+        weight_type = None,
         expert_id = None,
     ):
+        if not isinstance(task, ComputeTask):
+            raise TypeError("task must be a ComputeTask.")
+
+        if task.task_type != "linear":
+            raise ValueError(
+                f"HNArray does not support task_type({task.task_type})."
+            )
+
+        # Explicit routing values remain as a compatibility fallback for tasks
+        # created before routing metadata was stored directly in ComputeTask.
+        layer_id = task.layer_id if task.layer_id is not None else layer_id
+        weight_type = (
+            task.weight_type if task.weight_type is not None else weight_type
+        )
+        expert_id = task.expert_id if task.expert_id is not None else expert_id
+
         if not isinstance(layer_id, int) or isinstance(layer_id, bool):
-            raise TypeError("layer_id must be an integer.")
+            raise TypeError(
+                "A linear HNArray task must provide an integer layer_id."
+            )
         if not 0 <= layer_id < self.layer_num:
             raise ValueError(
                 f"layer_id must be between 0 and {self.layer_num - 1}."
             )
 
         if not isinstance(weight_type, str):
-            raise TypeError("weight_type must be a string.")
+            raise TypeError(
+                "A linear HNArray task must provide a string weight_type."
+            )
         if not weight_type.strip():
             raise ValueError("weight_type must not be empty.")
         if weight_type not in self.SUPPORTED_WEIGHT_TYPES:
