@@ -1,5 +1,13 @@
 class ComputeTask:
-    def __init__(self, request_id, task_type, workload):
+    def __init__(
+        self,
+        request_id,
+        task_type,
+        workload,
+        layer_id = None,
+        weight_type = None,
+        expert_id = None,
+    ):
         if request_id is None or (
             isinstance(request_id, str) and not request_id.strip()
         ):
@@ -17,9 +25,34 @@ class ComputeTask:
         if not isinstance(workload, dict):
             raise TypeError("workload must be a dict.")
 
+        if layer_id is not None:
+            if not isinstance(layer_id, int) or isinstance(layer_id, bool):
+                raise TypeError("layer_id must be an integer or None.")
+            if layer_id < 0:
+                raise ValueError("layer_id must be greater than or equal to 0.")
+
+        if weight_type is not None:
+            if not isinstance(weight_type, str):
+                raise TypeError("weight_type must be a string or None.")
+            if not weight_type.strip():
+                raise ValueError("weight_type must not be empty.")
+
+        if expert_id is not None:
+            if not isinstance(expert_id, int) or isinstance(expert_id, bool):
+                raise TypeError("expert_id must be an integer or None.")
+            if expert_id < 0:
+                raise ValueError("expert_id must be greater than or equal to 0.")
+
         self.request_id = request_id
         self.task_type = task_type
         self.workload = workload.copy()
+
+        # Identifies the Transformer layer that owns this task.
+        self.layer_id = layer_id
+        # Identifies the fixed-weight operation used for HNArray routing.
+        self.weight_type = weight_type
+        # Identifies the MoE expert associated with expert-specific computation.
+        self.expert_id = expert_id
 
 # The physical VEX also handles RMSNorm, SwiGLU, softmax, residual
 # addition, and sampling. Only attention has a timing model here because
