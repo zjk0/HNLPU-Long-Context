@@ -94,22 +94,13 @@ class VEX:
 
             for field_name in required_latency_fields:
                 latency_cycles = fixed_latency_cycles[field_name]
-                if not isinstance(latency_cycles, int) or isinstance(
-                    latency_cycles,
-                    bool,
-                ):
-                    raise TypeError(
-                        f"fixed_latency_cycles[{field_name!r}] must be an integer."
-                    )
+                if not isinstance(latency_cycles, int) or isinstance(latency_cycles, bool):
+                    raise TypeError(f"fixed_latency_cycles[{field_name!r}] must be an integer.")
                 if latency_cycles <= 0:
-                    raise ValueError(
-                        f"fixed_latency_cycles[{field_name!r}] must be greater than 0."
-                    )
+                    raise ValueError(f"fixed_latency_cycles[{field_name!r}] must be greater than 0.")
 
         self.cached_kv_heads_per_cycle = cached_kv_heads_per_cycle
-        self.fixed_latency_cycles = (
-            None if fixed_latency_cycles is None else fixed_latency_cycles.copy()
-        )
+        self.fixed_latency_cycles = None if fixed_latency_cycles is None else fixed_latency_cycles.copy()
         self.busy_until_cycle = 0
 
     def execute(self, task, request_cycle):

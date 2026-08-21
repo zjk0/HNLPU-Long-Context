@@ -1,0 +1,31 @@
+# Portable Conda environment for Ubuntu 24.04 (x86_64).
+# Platform-specific runtime libraries and transitive pip dependencies are
+# intentionally resolved on the target system.
+#
+# Migration commands:
+#   conda env create -f hnlpu-sim-ubuntu24.04.yml
+#   conda activate hnlpu-sim
+#   python -m pytest hnlpu_sim_test
+name: hnlpu-sim
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      # HNLPU simulator runtime dependencies
+      - matplotlib==3.11.0
+      - networkx==3.6.1
+      - numpy==2.4.6
+      - pandas==3.0.3
+      - pyyaml==6.0.3
+      - scipy==1.17.1
+      - simpy==4.1.2
+      - tqdm==4.68.3
+
+      # Development and interactive analysis tools
+      - black==26.5.1
+      - jupyter==1.1.1
+      - pytest==9.1.1
+      - rich==15.0.0
+      - ruff==0.15.18
