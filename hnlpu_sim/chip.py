@@ -46,7 +46,11 @@ class Chip:
             attention_buffer = self.attention_buffer,
             hbm = self.hbm,
         )
-        self.vex = VEX(cached_kv_heads_per_cycle = config.hnlpu["vex_cached_kv_heads_per_cycle_per_chip"])
+        self.vex = VEX(
+            layer_num = config.model["num_layers"],
+            cached_kv_heads_per_cycle = config.hnlpu["vex_cached_kv_heads_per_cycle_per_chip"],
+            fixed_latency_cycles = config.vex,
+        )
 
         chip_linear_id = row * config.hnlpu["chip_grid_cols"] + column
         experts_per_chip = config.model["num_experts"] // config.hnlpu["num_chips"]
