@@ -60,9 +60,15 @@ class ComputeTask:
 class VEX:
     def __init__(
         self,
+        layer_num,
         cached_kv_heads_per_cycle = 32,
         fixed_latency_cycles = None,
     ):
+        if not isinstance(layer_num, int) or isinstance(layer_num, bool):
+            raise TypeError("layer_num must be an integer.")
+        if layer_num <= 0:
+            raise ValueError("layer_num must be greater than 0.")
+
         if (
             not isinstance(cached_kv_heads_per_cycle, int)
             or isinstance(cached_kv_heads_per_cycle, bool)
@@ -99,9 +105,11 @@ class VEX:
                 if latency_cycles <= 0:
                     raise ValueError(f"fixed_latency_cycles[{field_name!r}] must be greater than 0.")
 
+        self.layer_num = layer_num
         self.cached_kv_heads_per_cycle = cached_kv_heads_per_cycle
         self.fixed_latency_cycles = None if fixed_latency_cycles is None else fixed_latency_cycles.copy()
-        self.busy_until_cycle = 0
+        # Each Transformer layer keeps an independent logical VEX busy state.
+        self.busy_until_cycle = [0] * layer_num
 
     def execute(self, task, request_cycle):
         if not isinstance(task, ComputeTask):
@@ -110,6 +118,14 @@ class VEX:
             raise TypeError("request_cycle must be an integer.")
         if request_cycle < 0:
             raise ValueError("request_cycle must be greater than or equal to 0.")
+
+        layer_id = task.layer_id
+        if layer_id is None:
+            raise ValueError("A VEX task must provide a layer_id.")
+        if not isinstance(layer_id, int) or isinstance(layer_id, bool):
+            raise TypeError("VEX task layer_id must be an integer.")
+        if not 0 <= layer_id < self.layer_num:
+            raise ValueError(f"VEX task layer_id must be between 0 and {self.layer_num - 1}.")
 
         legacy_unmodeled_task_types = (
             "rmsnorm",
@@ -201,12 +217,12 @@ class VEX:
             service_cycles = self.fixed_latency_cycles[latency_field]
             compute_workload = task.workload.copy()
 
-        start_cycle = max(request_cycle, self.busy_until_cycle)
+        start_cycle = max(request_cycle, self.busy_until_cycle[layer_id])
         wait_cycles = start_cycle - request_cycle
         finish_cycle = start_cycle + service_cycles
         total_latency_cycles = finish_cycle - request_cycle
 
-        self.busy_until_cycle = finish_cycle
+        self.busy_until_cycle[layer_id] = finish_cycle
 
         return {
             "request_cycle": request_cycle,
@@ -216,6 +232,7 @@ class VEX:
             "service_cycles": service_cycles,
             "total_latency_cycles": total_latency_cycles,
             "compute_workload": compute_workload,
+            "layer_id": layer_id,
         }
 
 class HNArray:
@@ -414,7 +431,7 @@ class HNUnit:
 
 
 if __name__ == "__main__":
-    vex = VEX()
+    vex = VEX(layer_num = 2)
     attention_task = ComputeTask(
         request_id = "request-0",
         task_type = "attention",
@@ -422,6 +439,7 @@ if __name__ == "__main__":
             "q_length": 1,
             "kv_length": 64,
         },
+        layer_id = 0,
     )
     first_vex_result = vex.execute(attention_task, request_cycle = 0)
     second_vex_result = vex.execute(attention_task, request_cycle = 0)
@@ -430,6 +448,70 @@ if __name__ == "__main__":
     assert first_vex_result["wait_cycles"] == 0
     assert second_vex_result["start_cycle"] == first_vex_result["finish_cycle"]
     assert second_vex_result["wait_cycles"] == first_vex_result["service_cycles"]
+
+    parallel_vex = VEX(layer_num = 2)
+    layer_0_attention_task = ComputeTask(
+        request_id = "request-0",
+        task_type = "attention",
+        workload = {
+            "q_length": 1,
+            "kv_length": 64,
+        },
+        layer_id = 0,
+    )
+    layer_1_attention_task = ComputeTask(
+        request_id = "request-0",
+        task_type = "attention",
+        workload = {
+            "q_length": 1,
+            "kv_length": 64,
+        },
+        layer_id = 1,
+    )
+    layer_0_parallel_result = parallel_vex.execute(
+        layer_0_attention_task,
+        request_cycle = 0,
+    )
+    layer_1_parallel_result = parallel_vex.execute(
+        layer_1_attention_task,
+        request_cycle = 0,
+    )
+
+    assert layer_0_parallel_result["start_cycle"] == 0
+    assert layer_1_parallel_result["start_cycle"] == 0
+    assert layer_0_parallel_result["layer_id"] == 0
+    assert layer_1_parallel_result["layer_id"] == 1
+
+    missing_layer_task = ComputeTask(
+        request_id = "request-0",
+        task_type = "attention",
+        workload = {
+            "q_length": 1,
+            "kv_length": 64,
+        },
+    )
+    try:
+        parallel_vex.execute(missing_layer_task, request_cycle = 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("VEX did not reject a missing layer_id.")
+
+    out_of_range_layer_task = ComputeTask(
+        request_id = "request-0",
+        task_type = "attention",
+        workload = {
+            "q_length": 1,
+            "kv_length": 64,
+        },
+        layer_id = 2,
+    )
+    try:
+        parallel_vex.execute(out_of_range_layer_task, request_cycle = 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("VEX did not reject an out-of-range layer_id.")
 
     for task_type in (
         "rmsnorm",
@@ -442,8 +524,9 @@ if __name__ == "__main__":
             request_id = "request-0",
             task_type = task_type,
             workload = {},
+            layer_id = 0,
         )
-        busy_until_cycle_before = vex.busy_until_cycle
+        busy_until_cycle_before = vex.busy_until_cycle.copy()
         try:
             vex.execute(vex_task, request_cycle = 0)
         except NotImplementedError:
@@ -459,6 +542,7 @@ if __name__ == "__main__":
             request_id = "request-0",
             task_type = task_type,
             workload = {},
+            layer_id = 0,
         )
         try:
             vex.execute(invalid_vex_task, request_cycle = 0)
