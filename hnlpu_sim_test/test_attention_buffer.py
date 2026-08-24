@@ -43,7 +43,7 @@ def test_stage_1_balanced_single_group_allocation_still_has_priority():
     assert attention_buffer.check_consistency()
 
 
-def test_stage_2_uses_greedy_single_group_for_uneven_bank_capacity():
+def test_stage_2_uses_round_robin_for_uneven_bank_capacity():
     attention_buffer = AttentionBuffer(
         num_banks = 4,
         bank_size_byte = 7,
@@ -64,37 +64,79 @@ def test_stage_2_uses_greedy_single_group_for_uneven_bank_capacity():
     allocation = attention_buffer.allocate_info["stage-2"]
 
     assert allocation["bank_groups"] == {0: 12}
-    assert allocation["bank"] == {0: 3, 1: 7, 2: 2}
-    assert attention_buffer.next_bank_group_offset[0] == 3
+    assert allocation["bank"] == {0: 3, 1: 4, 2: 4, 3: 1}
+    assert allocation["bank"] != {0: 3, 1: 7, 2: 2}
+    assert attention_buffer.next_bank_group_offset[0] == 0
+    assert attention_buffer.check_consistency()
+
+
+def test_stage_2_circular_traversal_accumulates_multiple_rounds():
+    attention_buffer = AttentionBuffer(
+        num_banks = 4,
+        bank_size_byte = 8,
+        banks_per_group = 4,
+        check_consistency = True,
+    )
+
+    seed_ids = [f"seed-{index}" for index in range(5)]
+    for seed_id in seed_ids:
+        assert attention_buffer.allocate_memory(4, seed_id)
+    for seed_id in seed_ids[1:4]:
+        assert attention_buffer.free_memory(seed_id)
+
+    assert attention_buffer.bank_usage_byte.tolist() == [8, 0, 0, 0]
+    assert attention_buffer.next_bank_group_offset[0] == 1
+
+    assert attention_buffer.allocate_memory(16, "stage-2-multi-round")
+    allocation = attention_buffer.allocate_info["stage-2-multi-round"]
+
+    assert allocation["bank_groups"] == {0: 16}
+    assert allocation["bank"] == {1: 8, 2: 4, 3: 4}
+    assert allocation["bank"][1] == 2 * attention_buffer.access_width_byte
+    assert attention_buffer.next_bank_group_offset[0] == 2
     assert attention_buffer.check_consistency()
 
 
 def test_stage_3_spans_groups_when_no_single_group_is_large_enough():
     attention_buffer = AttentionBuffer(
-        num_banks = 4,
+        num_banks = 6,
         bank_size_byte = 8,
-        banks_per_group = 2,
+        banks_per_group = 3,
         check_consistency = True,
     )
 
-    assert attention_buffer.allocate_memory(8, "seed-0")
-    assert attention_buffer.allocate_memory(8, "seed-1")
-    assert attention_buffer.allocate_memory(1, "cursor-seed")
-    assert attention_buffer.free_memory("cursor-seed")
-    assert attention_buffer.get_remaining_size() == 16
+    assert attention_buffer.allocate_memory(12, "cursor-seed-0")
+    assert attention_buffer.free_memory("cursor-seed-0")
+    assert attention_buffer.allocate_memory(12, "seed-1")
+    assert attention_buffer.allocate_memory(12, "cursor-seed-1")
+    assert attention_buffer.free_memory("cursor-seed-1")
+
+    assert attention_buffer.bank_group_usage_byte == [0, 12]
+    assert attention_buffer.get_remaining_size() == 36
     assert attention_buffer.next_bank_group_id == 1
     assert all(
-        attention_buffer.bank_group_size_byte - usage < 12
+        attention_buffer.bank_group_size_byte - usage < 25
         for usage in attention_buffer.bank_group_usage_byte
     )
 
-    assert attention_buffer.allocate_memory(12, "stage-3")
+    assert attention_buffer.allocate_memory(25, "stage-3")
     allocation = attention_buffer.allocate_info["stage-3"]
 
-    assert allocation["bank_groups"] == {1: 8, 0: 4}
-    assert allocation["bank"] == {2: 4, 3: 4, 1: 4}
+    assert allocation["bank_groups"] == {1: 12, 0: 13}
+    assert allocation["bank"] == {
+        3: 4,
+        4: 4,
+        5: 4,
+        0: 5,
+        1: 4,
+        2: 4,
+    }
     assert len(allocation["bank_groups"]) > 1
-    assert attention_buffer.next_bank_group_offset == [0, 0]
+    assert {
+        bank_id: allocation["bank"][bank_id]
+        for bank_id in range(3)
+    } == {0: 5, 1: 4, 2: 4}
+    assert attention_buffer.next_bank_group_offset == [1, 0]
     assert attention_buffer.next_bank_group_id == 1
     assert attention_buffer.check_consistency()
 

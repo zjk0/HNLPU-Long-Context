@@ -390,8 +390,9 @@ class AttentionBuffer(Memory):
             ) % self.num_bank_groups
             break
 
-        # Stage 2: if balanced striping cannot fit, greedily consume the first
-        # single group with enough aggregate remaining capacity.
+        # Stage 2: if balanced striping cannot fit, use access-width
+        # round-robin allocation in the first single group with enough
+        # aggregate remaining capacity.
         if planned_bank_allocations is None:
             for i in range(self.num_bank_groups):
                 group_id = (
@@ -408,34 +409,53 @@ class AttentionBuffer(Memory):
                 candidate_bank_allocations = {}
                 remaining_allocate_size = allocate_size_byte
                 last_allocated_bank_offset = None
+                current_bank_offset = self.next_bank_group_offset[group_id]
 
-                for j in range(self.banks_per_group):
-                    bank_offset = (
-                        self.next_bank_group_offset[group_id] + j
-                    ) % self.banks_per_group
-                    bank_id = group_start_id + bank_offset
-                    bank_remaining_size = int(
-                        self.bank_size_byte
-                        - self.bank_usage_byte[bank_id]
-                    )
-                    if bank_remaining_size == 0:
-                        continue
+                while remaining_allocate_size > 0:
+                    allocated_this_round = 0
 
-                    allocated_to_bank = min(
-                        remaining_allocate_size,
-                        bank_remaining_size,
-                    )
-                    candidate_bank_allocations[bank_id] = (
-                        allocated_to_bank
-                    )
-                    remaining_allocate_size -= allocated_to_bank
-                    last_allocated_bank_offset = bank_offset
+                    for _ in range(self.banks_per_group):
+                        bank_offset = current_bank_offset
+                        current_bank_offset = (
+                            current_bank_offset + 1
+                        ) % self.banks_per_group
+                        bank_id = group_start_id + bank_offset
+                        already_planned_size = (
+                            candidate_bank_allocations.get(bank_id, 0)
+                        )
+                        bank_remaining_size = int(
+                            self.bank_size_byte
+                            - self.bank_usage_byte[bank_id]
+                            - already_planned_size
+                        )
+                        if bank_remaining_size < 0:
+                            raise RuntimeError(
+                                "Planned Stage 2 allocation exceeds bank "
+                                f"{bank_id} capacity."
+                            )
+                        if bank_remaining_size == 0:
+                            continue
 
-                    if remaining_allocate_size == 0:
-                        break
+                        allocated_to_bank = min(
+                            self.access_width_byte,
+                            bank_remaining_size,
+                            remaining_allocate_size,
+                        )
+                        candidate_bank_allocations[bank_id] = (
+                            already_planned_size + allocated_to_bank
+                        )
+                        remaining_allocate_size -= allocated_to_bank
+                        allocated_this_round += allocated_to_bank
+                        last_allocated_bank_offset = bank_offset
 
-                if remaining_allocate_size != 0:
-                    continue
+                        if remaining_allocate_size == 0:
+                            break
+
+                    if allocated_this_round == 0:
+                        raise RuntimeError(
+                            "Stage 2 made no allocation progress despite "
+                            f"sufficient capacity in bank group {group_id}."
+                        )
 
                 planned_bank_allocations = candidate_bank_allocations
                 planned_group_allocations = {
@@ -449,8 +469,9 @@ class AttentionBuffer(Memory):
                 ) % self.num_bank_groups
                 break
 
-        # Stage 3: if no one group is large enough, greedily span groups in
-        # round-robin order. The total-capacity check above guarantees space.
+        # Stage 3: if no one group is large enough, span groups in round-robin
+        # order and use access-width round-robin allocation inside each group.
+        # The total-capacity check above guarantees space.
         if planned_bank_allocations is None:
             candidate_bank_allocations = {}
             candidate_group_allocations = {}
@@ -463,34 +484,71 @@ class AttentionBuffer(Memory):
                     start_bank_group_id + i
                 ) % self.num_bank_groups
                 group_start_id = group_id * self.banks_per_group
+                bank_group_remaining_size = (
+                    self.bank_group_size_byte
+                    - self.bank_group_usage_byte[group_id]
+                )
+                target_group_allocation_size = min(
+                    remaining_allocate_size,
+                    bank_group_remaining_size,
+                )
+                if target_group_allocation_size == 0:
+                    continue
+
                 allocated_to_group = 0
+                remaining_group_allocation_size = (
+                    target_group_allocation_size
+                )
                 last_allocated_bank_offset = None
+                current_bank_offset = self.next_bank_group_offset[group_id]
 
-                for j in range(self.banks_per_group):
-                    bank_offset = (
-                        self.next_bank_group_offset[group_id] + j
-                    ) % self.banks_per_group
-                    bank_id = group_start_id + bank_offset
-                    bank_remaining_size = int(
-                        self.bank_size_byte
-                        - self.bank_usage_byte[bank_id]
-                    )
-                    if bank_remaining_size == 0:
-                        continue
+                while remaining_group_allocation_size > 0:
+                    allocated_this_round = 0
 
-                    allocated_to_bank = min(
-                        remaining_allocate_size,
-                        bank_remaining_size,
-                    )
-                    candidate_bank_allocations[bank_id] = (
-                        allocated_to_bank
-                    )
-                    allocated_to_group += allocated_to_bank
-                    remaining_allocate_size -= allocated_to_bank
-                    last_allocated_bank_offset = bank_offset
+                    for _ in range(self.banks_per_group):
+                        bank_offset = current_bank_offset
+                        current_bank_offset = (
+                            current_bank_offset + 1
+                        ) % self.banks_per_group
+                        bank_id = group_start_id + bank_offset
+                        already_planned_size = (
+                            candidate_bank_allocations.get(bank_id, 0)
+                        )
+                        bank_remaining_size = int(
+                            self.bank_size_byte
+                            - self.bank_usage_byte[bank_id]
+                            - already_planned_size
+                        )
+                        if bank_remaining_size < 0:
+                            raise RuntimeError(
+                                "Planned Stage 3 allocation exceeds bank "
+                                f"{bank_id} capacity."
+                            )
+                        if bank_remaining_size == 0:
+                            continue
 
-                    if remaining_allocate_size == 0:
-                        break
+                        allocated_to_bank = min(
+                            self.access_width_byte,
+                            bank_remaining_size,
+                            remaining_group_allocation_size,
+                        )
+                        candidate_bank_allocations[bank_id] = (
+                            already_planned_size + allocated_to_bank
+                        )
+                        allocated_to_group += allocated_to_bank
+                        remaining_group_allocation_size -= allocated_to_bank
+                        remaining_allocate_size -= allocated_to_bank
+                        allocated_this_round += allocated_to_bank
+                        last_allocated_bank_offset = bank_offset
+
+                        if remaining_group_allocation_size == 0:
+                            break
+
+                    if allocated_this_round == 0:
+                        raise RuntimeError(
+                            "Stage 3 made no allocation progress despite "
+                            f"remaining capacity in bank group {group_id}."
+                        )
 
                 if allocated_to_group > 0:
                     candidate_group_allocations[group_id] = (
