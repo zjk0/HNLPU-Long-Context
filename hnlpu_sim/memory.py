@@ -196,37 +196,87 @@ class AttentionBuffer(Memory):
         allocated_size = 0
 
         for allocation in self.allocate_info.values():
-            if not all(key in allocation for key in ("size", "bank_group", "bank")):
+            if not all(
+                key in allocation
+                for key in ("size", "bank_groups", "bank")
+            ):
                 return False
 
             allocation_size = allocation["size"]
-            bank_group_id = allocation["bank_group"]
+            bank_group_allocations = allocation["bank_groups"]
             bank_allocations = allocation["bank"]
 
-            if allocation_size <= 0:
+            if (
+                not isinstance(allocation_size, int)
+                or isinstance(allocation_size, bool)
+                or allocation_size <= 0
+            ):
                 return False
-            if not 0 <= bank_group_id < self.num_bank_groups:
+            if not isinstance(bank_group_allocations, dict):
+                return False
+            if not bank_group_allocations:
+                return False
+            if not isinstance(bank_allocations, dict):
                 return False
             if not bank_allocations:
                 return False
 
-            first_bank_id = bank_group_id * self.banks_per_group
-            last_bank_id = first_bank_id + self.banks_per_group
+            allocation_size_from_groups = 0
+            for bank_group_id, allocated_size_byte in (
+                bank_group_allocations.items()
+            ):
+                if (
+                    not isinstance(bank_group_id, int)
+                    or isinstance(bank_group_id, bool)
+                    or not 0 <= bank_group_id < self.num_bank_groups
+                ):
+                    return False
+                if (
+                    not isinstance(allocated_size_byte, int)
+                    or isinstance(allocated_size_byte, bool)
+                    or allocated_size_byte <= 0
+                ):
+                    return False
+
+                allocated_by_group[bank_group_id] += allocated_size_byte
+                allocation_size_from_groups += allocated_size_byte
+
+            if allocation_size != allocation_size_from_groups:
+                return False
+
             allocation_size_from_banks = 0
+            allocation_size_by_group_from_banks = {}
 
             for bank_id, allocated_size_byte in bank_allocations.items():
-                if not first_bank_id <= bank_id < last_bank_id:
+                if (
+                    not isinstance(bank_id, int)
+                    or isinstance(bank_id, bool)
+                    or not 0 <= bank_id < self.num_banks
+                ):
                     return False
-                if allocated_size_byte <= 0:
+                if (
+                    not isinstance(allocated_size_byte, int)
+                    or isinstance(allocated_size_byte, bool)
+                    or allocated_size_byte <= 0
+                ):
+                    return False
+
+                bank_group_id = bank_id // self.banks_per_group
+                if bank_group_id not in bank_group_allocations:
                     return False
 
                 allocated_by_bank[bank_id] += allocated_size_byte
                 allocation_size_from_banks += allocated_size_byte
+                allocation_size_by_group_from_banks[bank_group_id] = (
+                    allocation_size_by_group_from_banks.get(bank_group_id, 0)
+                    + allocated_size_byte
+                )
 
             if allocation_size != allocation_size_from_banks:
                 return False
+            if allocation_size_by_group_from_banks != bank_group_allocations:
+                return False
 
-            allocated_by_group[bank_group_id] += allocation_size
             allocated_size += allocation_size
 
         if not np.array_equal(allocated_by_bank, self.bank_usage_byte):
@@ -261,98 +311,254 @@ class AttentionBuffer(Memory):
         if self.usage_byte + allocate_size_byte > self.size_byte:
             return False
 
-        # Calculate the striped allocation size for each bank in a group.
-        is_over_bank_groups = True
-        is_over_banks_in_group = True
-        temp_next_bank_group_id = self.next_bank_group_id
+        start_bank_group_id = self.next_bank_group_id
+        planned_bank_allocations = None
+        planned_group_allocations = None
+        planned_next_bank_group_offsets = {}
+        planned_next_bank_group_id = None
+
+        # Stage 1: preserve the balanced single-group allocation as the
+        # highest-priority path.
         allocate_bank_num = allocate_size_byte // self.access_width_byte
         base_num_per_bank = allocate_bank_num // self.banks_per_group
         additional_num = allocate_bank_num % self.banks_per_group
+        tail_size_byte = allocate_size_byte % self.access_width_byte
 
-        # Search each group in round-robin order until all target banks fit.
         for i in range(self.num_bank_groups):
-            group_id = (temp_next_bank_group_id + i) % self.num_bank_groups
-            is_over_bank_groups = True
-            if self.bank_group_usage_byte[group_id] + allocate_size_byte <= self.bank_group_size_byte:
-                is_over_bank_groups = False
-                group_start_id = group_id * self.banks_per_group
-                group_end_id = (
-                    ((group_id + 1) % self.num_bank_groups)* self.banks_per_group- 1
-                    if (group_id + 1) % self.num_bank_groups != 0
-                    else group_start_id + self.banks_per_group - 1
+            group_id = (start_bank_group_id + i) % self.num_bank_groups
+            bank_group_remaining_size = (
+                self.bank_group_size_byte
+                - self.bank_group_usage_byte[group_id]
+            )
+            if bank_group_remaining_size < allocate_size_byte:
+                continue
+
+            group_start_id = group_id * self.banks_per_group
+            candidate_bank_allocations = {}
+            base_size_per_bank = (
+                self.access_width_byte * base_num_per_bank
+            )
+
+            if base_size_per_bank > 0:
+                for bank_offset in range(self.banks_per_group):
+                    candidate_bank_allocations[
+                        group_start_id + bank_offset
+                    ] = base_size_per_bank
+
+            for j in range(additional_num):
+                bank_offset = (
+                    self.next_bank_group_offset[group_id] + j
+                ) % self.banks_per_group
+                bank_id = group_start_id + bank_offset
+                candidate_bank_allocations[bank_id] = (
+                    candidate_bank_allocations.get(bank_id, 0)
+                    + self.access_width_byte
                 )
-                if not np.all(
-                    self.bank_usage_byte[group_start_id : group_end_id + 1]
-                    + self.access_width_byte * base_num_per_bank
-                    <= self.bank_size_byte
-                ):
+
+            if tail_size_byte != 0:
+                bank_offset = (
+                    self.next_bank_group_offset[group_id] + additional_num
+                ) % self.banks_per_group
+                bank_id = group_start_id + bank_offset
+                candidate_bank_allocations[bank_id] = (
+                    candidate_bank_allocations.get(bank_id, 0)
+                    + tail_size_byte
+                )
+
+            if not all(
+                self.bank_usage_byte[bank_id] + bank_size
+                <= self.bank_size_byte
+                for bank_id, bank_size in candidate_bank_allocations.items()
+            ):
+                continue
+
+            planned_bank_allocations = candidate_bank_allocations
+            planned_group_allocations = {
+                group_id: allocate_size_byte,
+            }
+            real_additional_num = (
+                additional_num
+                if tail_size_byte == 0
+                else additional_num + 1
+            )
+            planned_next_bank_group_offsets[group_id] = (
+                self.next_bank_group_offset[group_id]
+                + real_additional_num
+            ) % self.banks_per_group
+            planned_next_bank_group_id = (
+                group_id + 1
+            ) % self.num_bank_groups
+            break
+
+        # Stage 2: if balanced striping cannot fit, greedily consume the first
+        # single group with enough aggregate remaining capacity.
+        if planned_bank_allocations is None:
+            for i in range(self.num_bank_groups):
+                group_id = (
+                    start_bank_group_id + i
+                ) % self.num_bank_groups
+                bank_group_remaining_size = (
+                    self.bank_group_size_byte
+                    - self.bank_group_usage_byte[group_id]
+                )
+                if bank_group_remaining_size < allocate_size_byte:
                     continue
 
-                # Check banks receiving one additional access-width unit.
-                is_additional_num_ok = True
-                for j in range(additional_num + 1):
-                    offset = (self.next_bank_group_offset[group_id] + j) % self.banks_per_group
-                    if j == additional_num and allocate_size_byte % self.access_width_byte != 0:
-                        if (
-                            self.bank_usage_byte[group_start_id + offset]
-                            + self.access_width_byte * base_num_per_bank
-                            + (allocate_size_byte % self.access_width_byte)
-                            > self.bank_size_byte
-                        ):
-                            is_additional_num_ok = False
-                            break
-                    if j < additional_num:
-                        if (
-                            self.bank_usage_byte[group_start_id + offset]
-                            + self.access_width_byte * base_num_per_bank
-                            + self.access_width_byte
-                            > self.bank_size_byte
-                        ):
-                            is_additional_num_ok = False
-                            break
-                if is_additional_num_ok:
-                    is_over_banks_in_group = False
+                group_start_id = group_id * self.banks_per_group
+                candidate_bank_allocations = {}
+                remaining_allocate_size = allocate_size_byte
+                last_allocated_bank_offset = None
+
+                for j in range(self.banks_per_group):
+                    bank_offset = (
+                        self.next_bank_group_offset[group_id] + j
+                    ) % self.banks_per_group
+                    bank_id = group_start_id + bank_offset
+                    bank_remaining_size = int(
+                        self.bank_size_byte
+                        - self.bank_usage_byte[bank_id]
+                    )
+                    if bank_remaining_size == 0:
+                        continue
+
+                    allocated_to_bank = min(
+                        remaining_allocate_size,
+                        bank_remaining_size,
+                    )
+                    candidate_bank_allocations[bank_id] = (
+                        allocated_to_bank
+                    )
+                    remaining_allocate_size -= allocated_to_bank
+                    last_allocated_bank_offset = bank_offset
+
+                    if remaining_allocate_size == 0:
+                        break
+
+                if remaining_allocate_size != 0:
+                    continue
+
+                planned_bank_allocations = candidate_bank_allocations
+                planned_group_allocations = {
+                    group_id: allocate_size_byte,
+                }
+                planned_next_bank_group_offsets[group_id] = (
+                    last_allocated_bank_offset + 1
+                ) % self.banks_per_group
+                planned_next_bank_group_id = (
+                    group_id + 1
+                ) % self.num_bank_groups
+                break
+
+        # Stage 3: if no one group is large enough, greedily span groups in
+        # round-robin order. The total-capacity check above guarantees space.
+        if planned_bank_allocations is None:
+            candidate_bank_allocations = {}
+            candidate_group_allocations = {}
+            candidate_next_bank_group_offsets = {}
+            remaining_allocate_size = allocate_size_byte
+            last_allocated_group_id = None
+
+            for i in range(self.num_bank_groups):
+                group_id = (
+                    start_bank_group_id + i
+                ) % self.num_bank_groups
+                group_start_id = group_id * self.banks_per_group
+                allocated_to_group = 0
+                last_allocated_bank_offset = None
+
+                for j in range(self.banks_per_group):
+                    bank_offset = (
+                        self.next_bank_group_offset[group_id] + j
+                    ) % self.banks_per_group
+                    bank_id = group_start_id + bank_offset
+                    bank_remaining_size = int(
+                        self.bank_size_byte
+                        - self.bank_usage_byte[bank_id]
+                    )
+                    if bank_remaining_size == 0:
+                        continue
+
+                    allocated_to_bank = min(
+                        remaining_allocate_size,
+                        bank_remaining_size,
+                    )
+                    candidate_bank_allocations[bank_id] = (
+                        allocated_to_bank
+                    )
+                    allocated_to_group += allocated_to_bank
+                    remaining_allocate_size -= allocated_to_bank
+                    last_allocated_bank_offset = bank_offset
+
+                    if remaining_allocate_size == 0:
+                        break
+
+                if allocated_to_group > 0:
+                    candidate_group_allocations[group_id] = (
+                        allocated_to_group
+                    )
+                    candidate_next_bank_group_offsets[group_id] = (
+                        last_allocated_bank_offset + 1
+                    ) % self.banks_per_group
+                    last_allocated_group_id = group_id
+
+                if remaining_allocate_size == 0:
                     break
 
-        if is_over_bank_groups or is_over_banks_in_group:
-            return False
+            if remaining_allocate_size == 0:
+                planned_bank_allocations = candidate_bank_allocations
+                planned_group_allocations = candidate_group_allocations
+                planned_next_bank_group_offsets = (
+                    candidate_next_bank_group_offsets
+                )
+                planned_next_bank_group_id = (
+                    last_allocated_group_id + 1
+                ) % self.num_bank_groups
 
-        self.next_bank_group_id = group_id
+        if planned_bank_allocations is None:
+            raise RuntimeError(
+                "Could not build an AttentionBuffer allocation plan despite "
+                "sufficient total remaining capacity."
+            )
 
-        # Prepare the allocation record before publishing it.
-        temp_allocate_info = {}
+        if sum(planned_bank_allocations.values()) != allocate_size_byte:
+            raise RuntimeError(
+                "Planned bank allocations do not match allocate_size_byte."
+            )
+        if sum(planned_group_allocations.values()) != allocate_size_byte:
+            raise RuntimeError(
+                "Planned bank-group allocations do not match "
+                "allocate_size_byte."
+            )
 
-        # Commit the total and bank-group usage.
+        planned_group_sizes_from_banks = {}
+        for bank_id, bank_size in planned_bank_allocations.items():
+            group_id = bank_id // self.banks_per_group
+            planned_group_sizes_from_banks[group_id] = (
+                planned_group_sizes_from_banks.get(group_id, 0)
+                + bank_size
+            )
+        if planned_group_sizes_from_banks != planned_group_allocations:
+            raise RuntimeError(
+                "Planned bank and bank-group allocations do not match."
+            )
+
+        # Commit only after a complete allocation plan has been validated.
         self.usage_byte += allocate_size_byte
-        temp_allocate_info["size"] = allocate_size_byte
+        for group_id, group_size in planned_group_allocations.items():
+            self.bank_group_usage_byte[group_id] += group_size
+        for bank_id, bank_size in planned_bank_allocations.items():
+            self.bank_usage_byte[bank_id] += bank_size
 
-        self.bank_group_usage_byte[self.next_bank_group_id] += allocate_size_byte
-        temp_allocate_info["bank_group"] = self.next_bank_group_id
-
-        # Commit the striped per-bank allocation.
-        temp_allocate_info["bank"] = {}
-        self.bank_usage_byte[group_start_id : group_end_id + 1] += self.access_width_byte * base_num_per_bank
-        for i in range(additional_num + 1):
-            offset = (self.next_bank_group_offset[self.next_bank_group_id] + i) % self.banks_per_group
-            if i == additional_num and allocate_size_byte % self.access_width_byte != 0:
-                self.bank_usage_byte[group_start_id + offset] += (allocate_size_byte % self.access_width_byte)
-                temp_allocate_info["bank"][group_start_id + offset] = (allocate_size_byte % self.access_width_byte)
-            if i < additional_num:
-                self.bank_usage_byte[group_start_id + offset] += self.access_width_byte
-                temp_allocate_info["bank"][group_start_id + offset] = self.access_width_byte
-
-        if base_num_per_bank > 0:
-            for i in range(self.banks_per_group):
-                if (group_start_id + i) in temp_allocate_info["bank"].keys():
-                    temp_allocate_info["bank"][group_start_id + i] += self.access_width_byte * base_num_per_bank
-                else:
-                    temp_allocate_info["bank"][group_start_id + i] = self.access_width_byte * base_num_per_bank
-
-        # Publish the allocation and advance round-robin cursors.
-        self.allocate_info[allocate_id] = temp_allocate_info
-        real_additional_num = additional_num if allocate_size_byte % self.access_width_byte == 0 else additional_num + 1
-        self.next_bank_group_offset[self.next_bank_group_id] = (self.next_bank_group_offset[self.next_bank_group_id] + real_additional_num) % self.banks_per_group
-        self.next_bank_group_id = (self.next_bank_group_id + 1) % self.num_bank_groups
+        self.allocate_info[allocate_id] = {
+            "size": allocate_size_byte,
+            "bank_groups": dict(planned_group_allocations),
+            "bank": dict(planned_bank_allocations),
+        }
+        for group_id, next_bank_offset in (
+            planned_next_bank_group_offsets.items()
+        ):
+            self.next_bank_group_offset[group_id] = next_bank_offset
+        self.next_bank_group_id = planned_next_bank_group_id
 
         self.ensure_consistent()
         return True
@@ -364,12 +570,14 @@ class AttentionBuffer(Memory):
         # The ID to free must exist
         if free_id not in self.allocate_info:
             raise ValueError(f"free_id({free_id}) does not exist.")
-        
-        self.usage_byte -= self.allocate_info[free_id]["size"]
-        self.bank_group_usage_byte[self.allocate_info[free_id]["bank_group"]] -= self.allocate_info[free_id]["size"]
-        for bank_id in self.allocate_info[free_id]["bank"].keys():
-            self.bank_usage_byte[bank_id] -= self.allocate_info[free_id]["bank"][bank_id]
-            
+
+        allocation = self.allocate_info[free_id]
+        self.usage_byte -= allocation["size"]
+        for group_id, group_size in allocation["bank_groups"].items():
+            self.bank_group_usage_byte[group_id] -= group_size
+        for bank_id, bank_size in allocation["bank"].items():
+            self.bank_usage_byte[bank_id] -= bank_size
+
         self.allocate_info.pop(free_id)
         self.ensure_consistent()
         return True
