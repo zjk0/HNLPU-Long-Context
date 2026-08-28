@@ -51,7 +51,16 @@ memory:
 
 interconnect:
   cxl_bandwidth_GBps_per_link: 128
+  # Simulator assumption: The paper reports inter-chip link latency < 100 ns,
+  # but does not provide an exact value; the simulator currently uses 100 ns.
   cxl_latency_ns: 100
+  collective_algorithms:
+    broadcast: direct
+    reduce: direct
+    scatter: direct
+    gather: direct
+    all_reduce: direct
+    all_gather: direct
 
 eval:
   context_lengths:

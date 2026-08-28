@@ -91,6 +91,7 @@ class Config:
             "interconnect": (
                 "cxl_bandwidth_GBps_per_link",
                 "cxl_latency_ns",
+                "collective_algorithms",
             ),
             "eval": (
                 "context_lengths",
@@ -166,6 +167,39 @@ class Config:
                     f"{weight_type} must be greater than 0."
                 )
 
+        collective_algorithms = config_data["interconnect"]["collective_algorithms"]
+        if not isinstance(collective_algorithms, dict):
+            raise TypeError("interconnect.collective_algorithms must be a mapping.")
+        collective_operations = (
+            "broadcast",
+            "reduce",
+            "scatter",
+            "gather",
+            "all_reduce",
+            "all_gather",
+        )
+        missing_collective_operations = [
+            operation
+            for operation in collective_operations
+            if operation not in collective_algorithms
+        ]
+        if missing_collective_operations:
+            raise KeyError(
+                "Missing keys in interconnect.collective_algorithms: "
+                + ", ".join(missing_collective_operations)
+            )
+        for operation, algorithm in collective_algorithms.items():
+            if not isinstance(algorithm, str):
+                raise TypeError(
+                    "interconnect.collective_algorithms."
+                    f"{operation} must be a string."
+                )
+            if not algorithm.strip():
+                raise ValueError(
+                    "interconnect.collective_algorithms."
+                    f"{operation} cannot be empty."
+                )
+
         integer_fields = {
             "model": (
                 "num_layers",
@@ -222,7 +256,6 @@ class Config:
             ),
             "interconnect": (
                 "cxl_bandwidth_GBps_per_link",
-                "cxl_latency_ns",
             ),
         }
         for section_name, field_names in positive_number_fields.items():
@@ -232,6 +265,12 @@ class Config:
                     raise TypeError(f"{section_name}.{field_name} must be a number.")
                 if value <= 0:
                     raise ValueError(f"{section_name}.{field_name} must be greater than 0.")
+
+        cxl_latency_ns = config_data["interconnect"]["cxl_latency_ns"]
+        if not isinstance(cxl_latency_ns, (int, float)) or isinstance(cxl_latency_ns, bool):
+            raise TypeError("interconnect.cxl_latency_ns must be a number.")
+        if cxl_latency_ns < 0:
+            raise ValueError("interconnect.cxl_latency_ns must be greater than or equal to 0.")
 
         for field_name in ("start", "stop", "num"):
             value = context_lengths[field_name]

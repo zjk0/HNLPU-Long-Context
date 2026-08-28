@@ -1,7 +1,8 @@
 # HNLPU 项目长会话上下文总结
 
-> 整理日期：2026-08-23  
-> 资料来源：指定 Codex JSONL 对话记录，以及对当前工作树的只读复核  
+> 初次整理日期：2026-08-23
+> 最近同步日期：2026-08-28
+> 资料来源：指定 Codex JSONL 对话记录、对当前工作树的复核、2026-08-24 的两次 AttentionBuffer 增量提交，以及 2026-08-27 至 28 的 Interconnect 初始化与测试
 > 目的：为后续开发、汇报和新会话接续提供一份可独立阅读的项目上下文
 
 ## 1. 记录范围与结论摘要
@@ -19,15 +20,15 @@
 - 会话原始工作目录：/media/kai/Biggest Area/none/PhD/HNLPU-Long-Context
 - 会话开始时 Git 状态：master 分支，提交 5cca6146539d62c77dcf858dc0aa7df6634341ef
 
-虽然文件被保存在 2026/07/01 目录中，但它不是只有 7 月 1 日的一轮对话，而是一条持续到 8 月 22 日、围绕同一仓库不断演进的长会话。原记录中的绝对路径使用 /media/kai，而当前工作树使用 /media/zjk；本文因此主要使用仓库相对路径。
+虽然文件被保存在 2026/07/01 目录中，但它不是只有 7 月 1 日的一轮对话，而是一条持续到 8 月 22 日、围绕同一仓库不断演进的长会话。原记录中的绝对路径使用 /media/kai；初次整理和本次 Interconnect 同步使用 /media/zjk，AttentionBuffer 增量同步期间还曾使用 F:\none\PhD\HNLPU-Long-Context。本文因此主要使用仓库相对路径。
 
 项目主线可以概括为：
 
 1. 先建立“性能指标随上下文长度变化”的解析评估脚本。
 2. 随后将目标升级为不执行真实 Transformer 数值计算、但能够模拟容量、资源竞争和周期依赖的 HNLPU 性能模拟器。
 3. 逐步完成 Memory、Attention Buffer、HBM、KV Cache、Request、Config、Compute 和 Chip 的第一版。
-4. 最后通过单层、多层和长上下文三份单芯片集成测试，验证计算流程、KV 隔离以及 Attention Buffer 向 HBM 溢出。
-5. Pipeline、双缓冲、Trace Loader、Interconnect、System、多请求与多芯片仍未真正实现。
+4. 通过单层、多层和长上下文三份单芯片集成测试、AttentionBuffer 定向测试和 Interconnect 定向测试，验证计算流程、KV 隔离、Attention Buffer 向 HBM 溢出、碎片化 allocation，以及 4×4 row/column topology 与物理 link 状态初始化。
+5. Interconnect 的构造、拓扑和动态 link busy state 已完成；具体通信操作与时延模型仍未实现。Pipeline、双缓冲、Trace Loader、System、多请求与完整多芯片执行也尚未完成。
 
 ## 2. 模拟器的最终定位
 
@@ -82,7 +83,8 @@ Chip
 └── HNArray
     └── HNUnit
 
-Interconnect / System                尚未完成
+Interconnect                         拓扑与 link 状态初始化已完成；通信 timing 尚未完成
+System                               尚未完成
 ~~~
 
 各对象职责如下：
@@ -99,7 +101,8 @@ Interconnect / System                尚未完成
 - HNArray：保存多个 HNUnit，并把线性任务路由到正确单元。
 - Chip：聚合本地存储、KV 管理和计算资源。
 - Pipeline：未来负责依赖调度、流水推进、HBM 双缓冲和访存/计算重叠。
-- Interconnect/System：未来负责 4×4 多芯片拓扑、通信竞争和全局调度。
+- Interconnect：只负责 Chip-to-Chip 通信；当前已建立 4×4 row/column fully-connected topology 和物理 link busy state，后续负责 collective timing 与链路竞争。
+- System：未来负责多 Chip 聚合、跨模块协调和全局调度。
 
 最重要的边界是：Memory 不理解 request、layer、token 等 Transformer 语义；这些语义由 KVcacheBlock 和 KVcacheManager 管理。
 
@@ -114,6 +117,8 @@ Interconnect / System                尚未完成
 | 8月4日至10日 | Config、Compute、Chip | 完成 YAML 配置接入、初版计算资源、Chip 聚合和首个 Prefill/Decode 联合测试 |
 | 8月12日至15日 | 边界测试 | 增加 runtime overrides、长上下文 HBM 溢出测试和三层 KV 隔离测试 |
 | 8月17日至22日 | 计算模型细化 | 引入 HNUnit，重构 HNArray，扩展 ComputeTask/VEX，并迁移三份集成测试 |
+| 8月24日 | AttentionBuffer 分配修正 | 保留 balanced 优先路径，增加 single-group 与 multi-group fallback、统一 bank_groups record，并把 fallback 的 bank 内策略细化为 access-width circular round-robin |
+| 8月27日至28日 | Interconnect 初始化 | 完成参数校验、单位换算、4×4 row/column groups、48条无向物理 link 的 busy state、配置接入和18项定向测试；未实现具体通信 timing |
 
 ### 4.1 第一阶段：解析性能模型
 
@@ -270,11 +275,14 @@ stall_time = T × r / (1 - r)
 分配策略：
 
 1. 从 next_bank_group_id 开始按 group 轮询搜索。
-2. 一个 allocation 必须完整放在一个 group。
-3. group 内按 4-byte word 条带化到 32 个 Bank。
-4. 每个 group 保存 next offset，避免余数长期落在低编号 Bank。
-5. group 总容量足够但某个目标 Bank 放不下时，继续搜索下一个 group。
-6. 所有 group 都无法满足规则布局时返回 False，由 KVcacheManager 尝试 HBM。
+2. Stage 1 保留 balanced single-group allocation：按 base_num_per_bank 与 remainder 将数据均匀条带化；group 总容量和所有目标 Bank 均能容纳时优先采用。
+3. Stage 2 在 Stage 1 全部失败后，寻找第一个总剩余容量足够的 group；从该 group 的 next offset 开始，以 access_width_byte 为单次上限在 Bank 间 circular round-robin，直到完整 allocation 被规划完毕。
+4. Stage 3 在没有单个 group 能完整容纳时，从 next_bank_group_id 开始跨 group 分配；每个 group 内仍采用相同的 access-width circular round-robin，允许一个 allocation 跨多个 Bank group。
+5. Bank 剩余容量不足 access_width_byte 但大于0时，按真实剩余字节分配，不浪费 1 至 3 byte tail；多轮访问同一 Bank 时在临时 plan 中累计其总字节数。
+6. Stage 1、2、3 的搜索和规划均不修改真实状态；只有 Bank 与 group 两级计划的总和都等于 allocate_size_byte 后，才统一提交 usage、索引和 cursor。
+7. 在内部状态一致的前提下，只要 Attention Buffer 总剩余容量足够，Stage 3 就应保证 allocation 成功；False 仅表示总容量不足，随后 KVcacheManager 才将整个 KV Block 回退到 HBM。
+
+round-robin cursor 规则为：Stage 1 保留原行为；Stage 2 把已使用 group 的 next offset 移到最后一次实际分配 Bank 的下一个位置，并把 next group 移到当前 group 的下一个；Stage 3 对每个已使用 group 分别更新 next offset，最终 next group 指向最后一个实际使用 group 的下一个。fallback 的 circular traversal 如果完整一轮没有分配任何字节，会抛出 RuntimeError，避免死循环或静默接受不一致状态。
 
 主要动态状态：
 
@@ -292,11 +300,14 @@ allocation 记录结构为：
 ~~~text
 allocation_id:
     size: 总逻辑字节数
-    bank_group: 所属group
+    bank_groups:
+        group_id: 该allocation在此group中的字节数
     bank:
         bank_id: 该allocation在此bank中的字节数
     ready_cycle: write完成后加入
 ~~~
+
+Stage 1 的单 group allocation 也统一使用 bank_groups 字典，而不再使用单值 bank_group 字段。check_consistency 会分别重建 Bank 与 group 用量，并检查两级映射都与 allocation size 和真实 usage 一致；free_memory 则遍历 bank_groups 与 bank 映射释放容量。read/write 继续只消费 bank 映射，因此无需为跨 group allocation 重新设计。
 
 读写时序：
 
@@ -408,7 +419,7 @@ Manager 不强制一次 read 的 Block 属于同一 Request 或 Layer；调用�
 - 没有主动迁移、淘汰、换入换出；
 - 混合 AB/HBM read 不是严格原子操作；
 - free_request 中途失败时，之前已释放的 Block 不回滚；
-- allocation 仍不能跨 Bank group。
+- 单个 KV Block 仍不会在 Attention Buffer 与 HBM 两个 memory tier 之间拆分；AB 总剩余容量不足时，整个 Block 才回退到 HBM。
 
 ### 6.3 [request.py](hnlpu_sim/request.py)
 
@@ -541,6 +552,42 @@ Manager 引用的 AttentionBuffer 和 HBM 与 Chip 自身持有的是同一对�
 - 按当前 Chip 坐标分配本地 Expert；
 - 用各 weight type 的 latency 映射创建 HNArray。
 
+### 6.7 [interconnect.py](hnlpu_sim/interconnect.py)
+
+Interconnect 的范围被明确限定为 HNLPU Chip 之间的通信，不负责 Attention Buffer 与 HBM、Memory 与 Compute 或其他片内数据搬运。当前构造函数接收：
+
+- chip_grid_rows、chip_grid_cols；
+- link_bandwidth_GBps、link_latency_ns；
+- clock_frequency_hz；
+- collective_algorithms 字典。
+
+行列数必须是大于0且非 bool 的 int；带宽和时钟必须是大于0且非 bool 的数值；link latency 必须是大于等于0且非 bool 的数值。collective_algorithms 必须包含 broadcast、reduce、scatter、gather、all_reduce 和 all_gather，且每个值都是非空字符串。算法名称没有被限制为 direct，以便后续加入 ring、tree、recursive_doubling 等抽象。
+
+构造过程保存原始参数，并得到：
+
+~~~text
+num_chips = chip_grid_rows × chip_grid_cols
+link_bandwidth_byte_per_s = link_bandwidth_GBps × 10^9
+link_latency_cycles = ceil(link_latency_ns × clock_frequency_hz / 10^9)
+~~~
+
+collective_algorithms 使用浅拷贝，避免调用方之后修改原字典而改变 Interconnect 的内部配置。4×4、128 GB/s、100 ns 和 1 GHz 时，num_chips 为16，带宽为128,000,000,000 byte/s，固定延迟为100 cycles。
+
+Topology 使用 row-major 线性 Chip ID：
+
+~~~text
+chip_id = row × chip_grid_cols + column
+
+row_groups[0] = [0, 1, 2, 3]
+column_groups[0] = [0, 4, 8, 12]
+~~~
+
+_build_links() 依次遍历所有 row group 和 column group，只组合每组中 source 之后的 destination，因此同一行或同一列内的每对 Chip 各建立一次直接物理 link。key 统一规范化为 `(min_chip_id, max_chip_id)`，不会同时创建 `(0, 1)` 和 `(1, 0)`。不同 row 且不同 column 的 Chip 之间没有直接 link。4×4 topology 最终共有48条无向 link：4行各6条加4列各6条。
+
+每个 key 在 link_busy_until_cycle 中初始化为0。当前模拟抽象让两个通信方向共享同一条物理 link 的 busy state，尚不区分 full-duplex 的方向资源；如果以后需要独立方向状态，应在 timing model 设计阶段单独扩展。
+
+本轮没有实现 broadcast、reduce、scatter、gather、all_reduce 或 all_gather 的通信路径和成本公式。配置中的 direct 目前只是算法名称占位，不参与 timing。
+
 ## 7. 发现并修复过的关键问题
 
 ### 7.1 Memory 与 Attention Buffer
@@ -559,6 +606,12 @@ Manager 引用的 AttentionBuffer 和 HBM 与 Chip 自身持有的是同一对�
 - continue / break 层级错误导致错误提交；
 - 一致性检查只在操作后执行；
 - 非对齐 allocation 合并读取时低估 issue cycles；
+- group 总容量足够但 Bank 剩余容量不均匀时，balanced striping 错误拒绝该 group；
+- AB 总容量足够但没有单个 group 能完整容纳时，allocation 错误返回 False 并提前 spill 到 HBM；
+- 旧单值 bank_group allocation record 无法表示跨 group allocation，现已统一为 bank_groups 字典；
+- fallback 最初按 Bank 逐个填满，数据过度集中；现改为每次最多分配 access_width_byte 的 circular round-robin，并正确累计同一 Bank 的多轮计划；
+- fallback circular traversal 未扣除尚未 commit 的同 Bank planned bytes 时可能重复使用容量，现已在计算 Bank remaining 时一并扣除；
+- allocation 搜索阶段提前修改容量或 cursor 可能破坏失败原子性，现统一先生成并校验 plan，再一次性 commit；
 - 高频一致性检查可能成为模拟器自身性能瓶颈。
 
 ### 7.2 KVcacheManager
@@ -723,24 +776,76 @@ ruff check hnlpu_sim hnlpu_sim_test
 
 因此，“会话最后一轮报告 Ruff 通过”与“本次全目录 Ruff 检查失败”应分开理解：前者可能只检查了当时修改范围，后者是当前对 hnlpu_sim 与 hnlpu_sim_test 的仓库级复核。本次没有修改这些代码。
 
-## 9. 会话结束时的文件状态
+### 8.4 2026-08-24 AttentionBuffer 增量测试
+
+新增 [test_attention_buffer.py](hnlpu_sim_test/test_attention_buffer.py)，把 AttentionBuffer 的碎片化分配从生产模块 main 区域之外单独纳入 pytest。最终7个定向测试覆盖：
+
+- Stage 1 的 balanced single-group allocation 保持最高优先级；
+- Stage 2 在 Bank usage 为 [4, 0, 0, 0]、bank size 为7 bytes、申请12 bytes 时，得到 {0: 3, 1: 4, 2: 4, 3: 1}，明确排除旧 greedy packing 的 {0: 3, 1: 7, 2: 2}；
+- Stage 2 的 allocation 至少绕 Bank 一周，同一 Bank 在多轮中累计两个4-byte quantum；
+- Stage 3 从非零 next group 开始跨多个 group，并在最后一个部分使用的 group 内保持 access-width round-robin 分布；
+- 总容量真正不足时返回 False，且 usage、Bank/group usage、record 和 cursor 均不变化；
+- 跨 group allocation 的 free 正确恢复所有容量账目；
+- 跨 group allocation 的 allocate → write → read 保持读写总字节数正确，并自然覆盖多个 group 中的 Bank。
+
+增量完成后的验证结果为：
+
+~~~text
+pytest -q hnlpu_sim_test/test_attention_buffer.py：7 passed
+pytest -q hnlpu_sim_test：10 passed
+memory.py 内置 AttentionBuffer/HBM 测试：PASSED
+kv_cache.py 内置 KVcacheManager 测试：PASSED
+ruff check hnlpu_sim/memory.py hnlpu_sim_test/test_attention_buffer.py：通过
+git diff --check：通过
+~~~
+
+这里的10项 pytest 由7项 AttentionBuffer 定向测试和原有3项单 Chip 集成测试组成。仓库级 Ruff 的既有5项问题仍应按8.3节理解；本次只验证了实际修改的 memory.py 与 test_attention_buffer.py。
+
+### 8.5 2026-08-27 至 28 Interconnect 增量测试
+
+新增 [test_interconnect.py](hnlpu_sim_test/test_interconnect.py)，共18项 pytest case，覆盖：
+
+- 4×4 topology 的16个 Chip；
+- row 0、row 3、column 0 和 column 3 的线性 Chip ID；
+- 同行和同列 direct link 存在，不同行且不同列的 link 不存在；
+- 4×4 topology 恰好生成48条无向 link，且不存在反向重复 key；
+- 所有 link_busy_until_cycle 初值均为0；
+- 128 GB/s 到128,000,000,000 byte/s 的换算；
+- 100 ns、1 GHz 到100 cycles 的换算，以及0 ns latency；
+- collective_algorithms 六个字段的保存和外部字典拷贝隔离；
+- 使用仓库 hnlpu_config.yaml 初始化 Interconnect；
+- rows、cols、bandwidth、latency、clock 和 collective algorithm 的类型、范围与缺失字段校验。
+
+增量完成后的验证结果为：
+
+~~~text
+pytest -q hnlpu_sim_test/test_interconnect.py：18 passed
+pytest -q hnlpu_sim_test：28 passed
+ruff check hnlpu_sim/interconnect.py hnlpu_sim/config.py hnlpu_sim_test/test_interconnect.py：通过
+git diff --check：通过
+~~~
+
+仓库级 Ruff 仍有8.3节记录的5项既有问题，本次没有为通过全目录 lint 而修改无关模块。
+
+## 9. 当前文件状态（截至2026-08-28）
 
 | 文件或目录 | 状态 |
 |---|---|
-| [hnlpu_config.yaml](hnlpu_config.yaml) | 已有模型、硬件、VEX、存储、互连和评估配置 |
+| [hnlpu_config.yaml](hnlpu_config.yaml) | 已有模型、硬件、VEX、存储、互连和评估配置；Interconnect 使用128 GB/s/link、作为 simulator assumption 的100 ns，以及六项 direct 算法占位 |
 | [performance_eval_simplify_codex.py](simplified_eval/performance_eval_simplify_codex.py) | 简化上下文长度性能评估 |
-| [memory.py](hnlpu_sim/memory.py) | Memory、AttentionBuffer、HBM 第一版及大量内置测试 |
+| [memory.py](hnlpu_sim/memory.py) | Memory、AttentionBuffer、HBM；AttentionBuffer 已支持三级分配、跨 group record、原子 plan/commit 和 access-width round-robin fallback |
 | [kv_cache.py](hnlpu_sim/kv_cache.py) | KVcacheBlock、KVcacheManager 第一版及内置测试 |
 | [request.py](hnlpu_sim/request.py) | Request 数据容器 |
-| [config.py](hnlpu_sim/config.py) | YAML 解析、校验、单位换算和 overrides |
+| [config.py](hnlpu_sim/config.py) | YAML 解析、校验、单位换算和 overrides；已校验 Interconnect latency 与六项 collective algorithm 配置 |
 | [compute.py](hnlpu_sim/compute.py) | ComputeTask、VEX、HNArray、HNUnit |
 | [chip.py](hnlpu_sim/chip.py) | 单 Chip 资源聚合 |
 | [pipeline.py](hnlpu_sim/pipeline.py) | 只有骨架，尚无真实调度 |
 | [trace.py](hnlpu_sim/trace.py) | 尚未实现 |
-| [interconnect.py](hnlpu_sim/interconnect.py) | 尚未实现 |
+| [interconnect.py](hnlpu_sim/interconnect.py) | 已完成构造参数校验、单位换算、row/column groups 和无向 link busy state；通信操作与 timing 尚未实现 |
 | [system.py](hnlpu_sim/system.py) | 尚未实现系统逻辑 |
-| [hnlpu_sim_test](hnlpu_sim_test) | 三份当前可通过的集成测试 |
+| [hnlpu_sim_test](hnlpu_sim_test) | 三份单 Chip 集成测试、7项 AttentionBuffer 测试和18项 Interconnect 测试，当前共28项 pytest 通过 |
 | [hnlpu-sim-ubuntu24.04.yml](hnlpu-sim-ubuntu24.04.yml) | 面向 Ubuntu 24.04 的便携 Conda 环境 |
+| [hnlpu-sim-windows.yml](hnlpu-sim-windows.yml) | 当前 Windows 环境配置 |
 
 Ubuntu 24.04 环境文件删除了原机器绝对 prefix、平台底层 Build 固定和大量传递依赖，保留 Python 3.11 与直接依赖。文件头已经包含创建和激活环境的命令；当前不含 CUDA 依赖。
 
@@ -777,6 +882,8 @@ Ubuntu 24.04 环境文件删除了原机器绝对 prefix、平台底层 Build �
 
 - HBM 6.4 TB/s；
 - HBM 100 ns；
+- Interconnect 当前采用100 ns 精确值；论文只报告 link latency 小于100 ns，因此该值是 simulator assumption；
+- collective_algorithms 当前全部写为 direct，但只是配置占位，不代表论文确认的通信算法或 timing；
 - HNArray 八类线性任务都为10 cycles；
 - VEX 向量操作固定周期；
 - Attention 使用 q_length × kv_length 的等价工作量；
@@ -800,11 +907,10 @@ Ubuntu 24.04 环境文件删除了原机器绝对 prefix、平台底层 Build �
 ### 10.5 其他限制
 
 - HBM 双缓冲或 staging buffer 未实现；
-- Interconnect、CXL 竞争和 4×4 多芯片执行未实现；
+- Interconnect 已完成 topology 和 link busy state 初始化，但 point-to-point/collective 路径、传输数据量、链路预约与竞争更新、具体通信时延均未实现；System 接入和完整 4×4 多芯片执行也尚未实现；
 - KV 主动迁移、淘汰、换入换出和自动 Block 拆分未实现；
-- 一个 allocation 不能跨 Bank group，可能因内部碎片提前回退 HBM；
 - HBM 没有 Channel/Stack 级并发；
-- Attention Buffer 不保存真实地址，也没有碎片整理；
+- Attention Buffer allocation 已能跨 Bank group，容量账目层面的 group/Bank 碎片不再导致提前 spill；但模型仍不保存真实地址或连续区间，也没有物理碎片整理；
 - 混合 AB/HBM read 不具备严格的两阶段原子提交；
 - free 不检查 allocation 是否仍有未完成访问；
 - Request 缺少参数校验与封装的状态推进方法；
@@ -824,8 +930,8 @@ Ubuntu 24.04 环境文件删除了原机器绝对 prefix、平台底层 Build �
 3. 把论文值、派生值和人为假设在 Config 中明确分组，并为假设建立敏感性实验。
 4. 实现最小 Pipeline/Simulator：事件队列、任务依赖、资源预约和完成事件。
 5. 建立独立 DoubleBuffer/HBMStagingBuffer，由 Pipeline 模拟 HBM 加载与 VEX 计算重叠。
-6. 实现 KV Block 自动拆分、主动迁移和淘汰，再研究 Bank group 内部碎片。
-7. 实现 Interconnect 与16颗 Chip 的映射，验证 KV head、Token row 和 Expert 分布。
+6. 实现 KV Block 自动拆分、主动迁移和淘汰；如需提高物理精度，再引入真实地址、连续区间和地址级碎片模型。
+7. 在已有 Interconnect topology 与 link state 上，单独研究并实现 point-to-point/collective timing 和链路竞争，再接入16颗 Chip 与 System，验证 KV head、Token row 和 Expert 分布。
 8. 实现 trace.py，支持真实 JSONL Trace 和合成长上下文负载。
 9. 增加多请求、Batch、跨 Chip、双缓冲、异常原子性和论文校准点回归测试。
 10. 将 hnlpu_sim 整理为正式 Python package，并把生产文件中的内置测试逐步迁移到独立测试目录。
@@ -871,3 +977,120 @@ arrival_cycle =
 - 先跑通最小链路，再扩展到 Pipeline、多请求和多芯片。
 
 这套偏好与当前项目阶段相匹配：优先保证职责清晰、状态可核对和测试可复现，再逐步提高物理精度。
+
+## 14. 2026-08-24 至 25 增量同步：AttentionBuffer allocation
+
+本节记录初次总结之后的两轮 AttentionBuffer 讨论和实现。实际代码提交发生在2026年8月24日，本文于8月25日同步。
+
+### 14.1 第一轮：消除容量碎片导致的错误 HBM spill
+
+第一轮修改对应提交 0d3cdb9，目标是在不重构整个 AttentionBuffer 的前提下解决两类错误拒绝：
+
+1. 某个 group 总剩余容量足够，但 Bank 剩余容量不均匀，原 balanced striping 无法放入；
+2. AB 总剩余容量足够，但任何单个 group 都无法完整容纳，原代码直接返回 False。
+
+最终采用三级策略：
+
+~~~text
+Stage 1：balanced single-group allocation
+Stage 2：single-group fallback
+Stage 3：multi-group fallback
+~~~
+
+Stage 1 被完整保留为优先路径。Stage 2 选择第一个 aggregate remaining 足够的 group；Stage 3 在 AB 总容量足够时跨多个 group 规划。allocation record 从单值 bank_group 统一改为 bank_groups 字典，check_consistency 和 free_memory 做了最小必要适配，read/write 因始终读取 bank 映射而没有修改。
+
+本轮特别确认了 allocation 的事务式语义：所有阶段先构建 planned_bank_allocations、planned_group_allocations 和计划 cursor；只有两级计划的总和都等于请求大小后才修改真实状态。AB 与 HBM 之间仍不拆分同一个 KV Block。
+
+### 14.2 第二轮：fallback 从填满式 packing 改为 access-width round-robin
+
+第二轮修改对应提交 ad2748d。讨论指出第一轮 Stage 2/3 虽然解决了容量可用性问题，但仍采用：
+
+~~~python
+allocated_to_bank = min(
+    remaining_allocate_size,
+    bank_remaining_size,
+)
+~~~
+
+这种写法会先尽量填满当前 Bank，再访问下一个 Bank，使 fallback allocation 集中在少数 Bank 上，不符合既有 Bank 级并行模型的目标。
+
+最终语义改为：
+
+~~~python
+allocated_to_bank = min(
+    self.access_width_byte,
+    bank_remaining_size,
+    remaining_allocate_size,
+)
+~~~
+
+Stage 2 在单个 group 内循环多轮；Stage 3 按 group round-robin，并在每个 group 内使用相同的多轮 Bank circular traversal。Bank 剩余少于 access width 时仍使用全部实际剩余字节。由于真实状态在规划阶段不能修改，计算 bank_remaining_size 时还必须减去 candidate_bank_allocations 中该 Bank 已经规划的字节；同一 Bank 多轮获得的数据则累加到 allocation record 的单个条目中。
+
+为避免 circular traversal 死循环，每一完整 Bank round 都统计 allocated_this_round；如果仍有目标字节但本轮没有任何进展，则抛出 RuntimeError。cursor 始终依据最后一次实际 allocation 更新，而不是依据最后一次被检查但已满的 Bank 更新。
+
+### 14.3 范围约束与当前结论
+
+本次两轮代码修改仅涉及：
+
+- [memory.py](hnlpu_sim/memory.py) 中 AttentionBuffer.allocate_memory、check_consistency 和 free_memory；第二轮只继续修改 allocate_memory 的 Stage 2/3；
+- [test_attention_buffer.py](hnlpu_sim_test/test_attention_buffer.py) 的新增和断言更新。
+
+没有修改 HBM、KVcacheManager、Chip、ComputeTask、HNArray、VEX、Interconnect、Pipeline 或 System。当前可以认为容量级 invariant 已收敛为：在参数合法、内部状态一致且 AB 总剩余容量不小于 allocation size 时，allocation 不会再因为 Bank/group 容量分布不均而返回 False；fallback 同时尽量保持 access-width 粒度的 Bank 间均匀分布。
+
+## 15. 2026-08-27 至 28 增量同步：Interconnect 初始化
+
+### 15.1 本轮范围与模块边界
+
+本轮只完成 Interconnect 的构造和必要辅助初始化，主要修改：
+
+- [interconnect.py](hnlpu_sim/interconnect.py)；
+- [hnlpu_config.yaml](hnlpu_config.yaml)；
+- [config.py](hnlpu_sim/config.py) 中读取新配置所需的最小校验；
+- 新增 [test_interconnect.py](hnlpu_sim_test/test_interconnect.py)。
+
+没有修改 Memory、KV Cache、Compute、HNArray、Chip、Pipeline 或 System。Interconnect 只模拟 Chip-to-Chip communication；Attention Buffer 与 HBM、Memory 与 Compute 以及其他片内数据传输继续由对应模块负责。
+
+### 15.2 构造参数、派生量与配置归类
+
+最终构造接口为：
+
+~~~python
+Interconnect(
+    chip_grid_rows,
+    chip_grid_cols,
+    link_bandwidth_GBps,
+    link_latency_ns,
+    clock_frequency_hz,
+    collective_algorithms,
+)
+~~~
+
+其中 grid 尺寸、单 link 带宽和系统时钟属于硬件/系统配置输入；当前项目使用4×4、128 GB/s/link 和1 GHz。论文只给出 inter-chip link latency 小于100 ns，配置中的100 ns 是 simulator assumption，不是论文精确值。collective_algorithms 属于模拟器建模配置，六个 direct 仅为当前占位名称。
+
+构造器保存原始单位，同时生成 num_chips、byte/s 带宽和使用 math.ceil 换算的 cycle latency。算法字典被复制，外部调用方后续修改原字典不会改变已创建对象。
+
+### 15.3 Topology 与动态 link state
+
+Chip 使用 row-major ID，row_groups 和 column_groups 使用 dict 保存。每个组内的所有 Chip pair 都有 direct link，因此 topology 是“同行全连接 + 同列全连接”，而不是16颗 Chip 全连接。
+
+_build_links() 的三层核心过程是：遍历 row/column 两类 group，遍历每个 group 中的 source，再只遍历 source 之后的 destination。这样每一无向 pair 只产生一次；规范化 key `(min(src, dst), max(src, dst))` 又显式保证方向不会重复。对4×4 grid：
+
+~~~text
+row links    = 4 × C(4, 2) = 24
+column links = 4 × C(4, 2) = 24
+total links  = 48
+~~~
+
+静态 topology 与动态状态被分开理解：row_groups、column_groups 和 link key 集合描述连接关系；link_busy_until_cycle 的值描述每条物理 link 当前忙到哪个 cycle，并全部从0开始。当前 `(0, 1)` 同时代表0→1和1→0，两个方向共享同一资源状态；尚未建立 full-duplex 的方向独立状态。
+
+### 15.4 Config 接入与校验
+
+hnlpu_config.yaml 沿用 hnlpu.chip_grid_rows、hnlpu.chip_grid_cols 和 hnlpu.clock_GHz，避免在 interconnect section 建立重复配置源。interconnect section 保留已有 cxl_bandwidth_GBps_per_link 与 cxl_latency_ns，并加入六项 collective_algorithms。
+
+Config 和 Interconnect 均校验 collective 字典的必需字段和值类型；Interconnect 还独立严格校验所有构造参数，包括拒绝 Python bool 被当作 int/float 接受。当前只校验算法名称是非空字符串，不预先限制算法集合。
+
+### 15.5 测试结果与未实现边界
+
+18项定向测试和完整28项 pytest 均通过，覆盖拓扑、link、单位换算、配置集成、字典拷贝和非法参数。实际修改范围的 Ruff 与 git diff --check 通过；全仓库仍有5项与本轮无关的既有 Ruff 问题。
+
+本轮没有实现 all_reduce、all_gather、broadcast、reduce、scatter 或 gather，也没有为 direct、ring、tree 等名称加入 timing 公式。link_busy_until_cycle 目前只是已经初始化的动态状态容器，尚无通信方法更新它。下一阶段应先明确 collective 的参与 Chip group、通信步骤、每步数据量和 link 预约规则，再实现时延模型。
