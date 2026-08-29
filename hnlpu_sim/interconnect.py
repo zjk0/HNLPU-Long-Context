@@ -1,14 +1,113 @@
 import math
 
+SUPPORTED_COMMUNICATION_OPERATIONS = (
+    "broadcast",
+    "reduce",
+    "scatter",
+    "gather",
+    "all_reduce",
+    "all_gather",
+)
+
+SUPPORTED_COMMUNICATION_DIRECTIONS = (
+    "row",
+    "column",
+    "all",
+)
+
+
+class CommunicationTask:
+    COMMUNICATION_OPERATIONS = SUPPORTED_COMMUNICATION_OPERATIONS
+    COMMUNICATION_DIRECTIONS = SUPPORTED_COMMUNICATION_DIRECTIONS
+
+    def __init__(
+        self,
+        request_id,
+        operation,
+        participants,
+        data_size_byte,
+        source_chip = None,
+        destination_chip = None,
+        direction = None,
+    ):
+        if request_id is None or (isinstance(request_id, str) and not request_id.strip()):
+            raise ValueError("request_id must not be empty.")
+        try:
+            hash(request_id)
+        except TypeError as exc:
+            raise TypeError("request_id must be hashable.") from exc
+
+        if not isinstance(operation, str):
+            raise TypeError("operation must be a string.")
+        if not operation.strip():
+            raise ValueError("operation must not be empty.")
+        if operation not in self.COMMUNICATION_OPERATIONS:
+            raise ValueError(f"Unsupported communication operation({operation}).")
+
+        if not isinstance(participants, list):
+            raise TypeError("participants must be a list.")
+        if not participants:
+            raise ValueError("participants must not be empty.")
+        for participant in participants:
+            if not isinstance(participant, int) or isinstance(participant, bool):
+                raise TypeError("Every participant must be an integer.")
+            if participant < 0:
+                raise ValueError("Every participant must be greater than or equal to 0.")
+        if len(set(participants)) != len(participants):
+            raise ValueError("participants must not contain duplicates.")
+
+        if not isinstance(data_size_byte, int) or isinstance(data_size_byte, bool):
+            raise TypeError("data_size_byte must be an integer.")
+        if data_size_byte <= 0:
+            raise ValueError("data_size_byte must be greater than 0.")
+
+        for field_name, chip_id in (
+            ("source_chip", source_chip),
+            ("destination_chip", destination_chip),
+        ):
+            if chip_id is None:
+                continue
+            if not isinstance(chip_id, int) or isinstance(chip_id, bool):
+                raise TypeError(f"{field_name} must be an integer or None.")
+            if chip_id < 0:
+                raise ValueError(f"{field_name} must be greater than or equal to 0.")
+            if chip_id not in participants:
+                raise ValueError(f"{field_name} must be present in participants.")
+
+        if direction is not None:
+            if not isinstance(direction, str):
+                raise TypeError("direction must be a string or None.")
+            if direction not in self.COMMUNICATION_DIRECTIONS:
+                raise ValueError(f"Unsupported communication direction({direction}).")
+
+        if operation in ("broadcast", "scatter"):
+            if source_chip is None:
+                raise ValueError(f"operation({operation}) requires source_chip.")
+            if destination_chip is not None:
+                raise ValueError(f"operation({operation}) requires destination_chip to be None.")
+        elif operation in ("reduce", "gather"):
+            if destination_chip is None:
+                raise ValueError(f"operation({operation}) requires destination_chip.")
+            if source_chip is not None:
+                raise ValueError(f"operation({operation}) requires source_chip to be None.")
+        else:
+            if source_chip is not None or destination_chip is not None:
+                raise ValueError(
+                    f"operation({operation}) requires source_chip and "
+                    "destination_chip to be None."
+                )
+
+        self.request_id = request_id
+        self.operation = operation
+        self.participants = participants.copy()
+        self.data_size_byte = data_size_byte
+        self.source_chip = source_chip
+        self.destination_chip = destination_chip
+        self.direction = direction
+
+
 class Interconnect:
-    COLLECTIVE_OPERATIONS = (
-        "broadcast",
-        "reduce",
-        "scatter",
-        "gather",
-        "all_reduce",
-        "all_gather",
-    )
+    COLLECTIVE_OPERATIONS = SUPPORTED_COMMUNICATION_OPERATIONS
 
     def __init__(
         self,

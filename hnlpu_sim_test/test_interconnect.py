@@ -8,7 +8,7 @@ HNLPU_SIM_PATH = PROJECT_ROOT / "hnlpu_sim"
 sys.path.insert(0, str(HNLPU_SIM_PATH))
 
 from config import Config  # noqa: E402
-from interconnect import Interconnect  # noqa: E402
+from interconnect import CommunicationTask, Interconnect  # noqa: E402
 
 
 COLLECTIVE_ALGORITHMS = {
@@ -32,6 +32,263 @@ def _create_interconnect(**overrides):
     }
     parameters.update(overrides)
     return Interconnect(**parameters)
+
+
+def _create_communication_task(**overrides):
+    parameters = {
+        "request_id": "req-0",
+        "operation": "all_reduce",
+        "participants": [0, 1, 2, 3],
+        "data_size_byte": 1024,
+        "direction": "row",
+    }
+    parameters.update(overrides)
+    return CommunicationTask(**parameters)
+
+
+def test_initializes_reduce_communication_task_and_copies_participants():
+    participants = [0, 4, 8, 12]
+    task = CommunicationTask(
+        request_id = "req-0",
+        operation = "reduce",
+        participants = participants,
+        data_size_byte = 1024,
+        destination_chip = 8,
+        direction = "column",
+    )
+
+    assert task.request_id == "req-0"
+    assert task.operation == "reduce"
+    assert task.participants == [0, 4, 8, 12]
+    assert task.data_size_byte == 1024
+    assert task.source_chip is None
+    assert task.destination_chip == 8
+    assert task.direction == "column"
+
+    participants.append(16)
+    assert task.participants == [0, 4, 8, 12]
+
+
+def test_initializes_all_reduce_communication_task_without_root_chips():
+    task = _create_communication_task()
+
+    assert task.operation == "all_reduce"
+    assert task.source_chip is None
+    assert task.destination_chip is None
+    for excluded_field in (
+        "algorithm",
+        "request_cycle",
+        "start_cycle",
+        "finish_cycle",
+        "wait_cycles",
+        "service_cycles",
+        "total_latency_cycles",
+    ):
+        assert not hasattr(task, excluded_field)
+
+
+def test_initializes_broadcast_communication_task_with_source():
+    task = CommunicationTask(
+        request_id = "req-0",
+        operation = "broadcast",
+        participants = [0, 1, 2, 3],
+        data_size_byte = 1024,
+        source_chip = 2,
+        direction = "row",
+    )
+
+    assert task.source_chip == 2
+    assert task.destination_chip is None
+
+
+@pytest.mark.parametrize(
+    ("request_id", "expected_exception"),
+    (
+        (None, ValueError),
+        ("", ValueError),
+        ("  ", ValueError),
+        ([], TypeError),
+    ),
+)
+def test_communication_task_rejects_invalid_request_id(
+    request_id,
+    expected_exception,
+):
+    with pytest.raises(expected_exception):
+        _create_communication_task(request_id = request_id)
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_exception"),
+    (
+        (None, TypeError),
+        ("", ValueError),
+        ("all_reduse", ValueError),
+    ),
+)
+def test_communication_task_rejects_invalid_operation(
+    operation,
+    expected_exception,
+):
+    with pytest.raises(expected_exception):
+        _create_communication_task(operation = operation)
+
+
+@pytest.mark.parametrize(
+    ("participants", "expected_exception"),
+    (
+        ((0, 1), TypeError),
+        ([], ValueError),
+        ([0, 1.0], TypeError),
+        ([0, True], TypeError),
+        ([0, -1], ValueError),
+        ([0, 1, 1, 2], ValueError),
+    ),
+)
+def test_communication_task_rejects_invalid_participants(
+    participants,
+    expected_exception,
+):
+    with pytest.raises(expected_exception):
+        _create_communication_task(participants = participants)
+
+
+@pytest.mark.parametrize(
+    ("data_size_byte", "expected_exception"),
+    (
+        (1024.0, TypeError),
+        (True, TypeError),
+        (0, ValueError),
+        (-1, ValueError),
+    ),
+)
+def test_communication_task_rejects_invalid_data_size(
+    data_size_byte,
+    expected_exception,
+):
+    with pytest.raises(expected_exception):
+        _create_communication_task(data_size_byte = data_size_byte)
+
+
+@pytest.mark.parametrize(
+    ("source_chip", "expected_exception"),
+    (
+        ("0", TypeError),
+        (True, TypeError),
+        (-1, ValueError),
+        (8, ValueError),
+    ),
+)
+def test_communication_task_rejects_invalid_source_chip(
+    source_chip,
+    expected_exception,
+):
+    with pytest.raises(expected_exception):
+        _create_communication_task(
+            operation = "broadcast",
+            source_chip = source_chip,
+        )
+
+
+@pytest.mark.parametrize(
+    ("destination_chip", "expected_exception"),
+    (
+        ("0", TypeError),
+        (False, TypeError),
+        (-1, ValueError),
+        (8, ValueError),
+    ),
+)
+def test_communication_task_rejects_invalid_destination_chip(
+    destination_chip,
+    expected_exception,
+):
+    with pytest.raises(expected_exception):
+        _create_communication_task(
+            operation = "reduce",
+            destination_chip = destination_chip,
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_message"),
+    (
+        ({"operation": "broadcast"}, "requires source_chip"),
+        ({"operation": "scatter"}, "requires source_chip"),
+        ({"operation": "reduce"}, "requires destination_chip"),
+        ({"operation": "gather"}, "requires destination_chip"),
+        (
+            {
+                "operation": "broadcast",
+                "source_chip": 0,
+                "destination_chip": 1,
+            },
+            "requires destination_chip to be None",
+        ),
+        (
+            {
+                "operation": "scatter",
+                "source_chip": 0,
+                "destination_chip": 1,
+            },
+            "requires destination_chip to be None",
+        ),
+        (
+            {
+                "operation": "reduce",
+                "source_chip": 0,
+                "destination_chip": 1,
+            },
+            "requires source_chip to be None",
+        ),
+        (
+            {
+                "operation": "gather",
+                "source_chip": 0,
+                "destination_chip": 1,
+            },
+            "requires source_chip to be None",
+        ),
+        (
+            {"operation": "all_reduce", "destination_chip": 1},
+            "requires source_chip and destination_chip to be None",
+        ),
+        (
+            {"operation": "all_gather", "source_chip": 0},
+            "requires source_chip and destination_chip to be None",
+        ),
+    ),
+)
+def test_communication_task_enforces_operation_specific_root_semantics(
+    overrides,
+    expected_message,
+):
+    with pytest.raises(ValueError, match = expected_message):
+        _create_communication_task(**overrides)
+
+
+@pytest.mark.parametrize(
+    ("direction", "expected_exception"),
+    (
+        (1, TypeError),
+        ("diagonal", ValueError),
+    ),
+)
+def test_communication_task_rejects_invalid_direction(
+    direction,
+    expected_exception,
+):
+    with pytest.raises(expected_exception):
+        _create_communication_task(direction = direction)
+
+
+def test_communication_task_leaves_topology_consistency_to_interconnect():
+    task = _create_communication_task(
+        participants = [0, 5, 99],
+        direction = "row",
+    )
+
+    assert task.participants == [0, 5, 99]
 
 
 def test_initializes_4_by_4_row_column_fully_connected_topology():
