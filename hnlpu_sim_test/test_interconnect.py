@@ -46,6 +46,19 @@ def _create_communication_task(**overrides):
     return CommunicationTask(**parameters)
 
 
+def _create_reduce_task(**overrides):
+    parameters = {
+        "request_id": "req-0",
+        "operation": "reduce",
+        "participants": [0, 4, 8, 12],
+        "data_size_byte": 128,
+        "destination_chip": 8,
+        "direction": "column",
+    }
+    parameters.update(overrides)
+    return CommunicationTask(**parameters)
+
+
 def test_initializes_reduce_communication_task_and_copies_participants():
     participants = [0, 4, 8, 12]
     task = CommunicationTask(
@@ -417,3 +430,214 @@ def test_rejects_empty_collective_algorithm():
         _create_interconnect(
             collective_algorithms = collective_algorithms,
         )
+
+
+def test_direct_reduce_uses_column_links_in_one_parallel_phase():
+    interconnect = _create_interconnect()
+    task = _create_reduce_task()
+
+    result = interconnect.reduce(task, request_cycle = 0)
+
+    assert result == {
+        "request_id": "req-0",
+        "operation": "reduce",
+        "algorithm": "direct",
+        "participants": [0, 4, 8, 12],
+        "destination_chip": 8,
+        "direction": "column",
+        "data_size_byte": 128,
+        "request_cycle": 0,
+        "start_cycle": 0,
+        "finish_cycle": 101,
+        "wait_cycles": 0,
+        "service_cycles": 101,
+        "total_latency_cycles": 101,
+        "used_links": [(0, 8), (4, 8), (8, 12)],
+    }
+
+    for link in result["used_links"]:
+        assert interconnect.link_busy_until_cycle[link] == 101
+    assert interconnect.link_busy_until_cycle[(0, 1)] == 0
+
+    for timing_field in (
+        "request_cycle",
+        "start_cycle",
+        "finish_cycle",
+        "wait_cycles",
+        "service_cycles",
+        "total_latency_cycles",
+    ):
+        assert not hasattr(task, timing_field)
+
+
+def test_direct_reduce_waits_for_all_required_links():
+    interconnect = _create_interconnect()
+    task = _create_reduce_task()
+
+    first_result = interconnect.reduce(task, request_cycle = 0)
+    second_result = interconnect.reduce(task, request_cycle = 50)
+
+    assert first_result["finish_cycle"] == 101
+    assert second_result["start_cycle"] == 101
+    assert second_result["finish_cycle"] == 202
+    assert second_result["wait_cycles"] == 51
+    assert second_result["service_cycles"] == 101
+    assert second_result["total_latency_cycles"] == 152
+    for link in second_result["used_links"]:
+        assert interconnect.link_busy_until_cycle[link] == 202
+
+
+def test_direct_reduce_ignores_unrelated_busy_links():
+    interconnect = _create_interconnect()
+    interconnect.link_busy_until_cycle[(0, 1)] = 1000
+
+    result = interconnect.reduce(_create_reduce_task(), request_cycle = 25)
+
+    assert result["start_cycle"] == 25
+    assert result["finish_cycle"] == 126
+    assert interconnect.link_busy_until_cycle[(0, 1)] == 1000
+
+
+def test_direct_reduce_rounds_serialization_latency_up_to_whole_cycles():
+    interconnect = _create_interconnect()
+    task = _create_reduce_task(data_size_byte = 129)
+
+    result = interconnect.reduce(task, request_cycle = 0)
+
+    assert result["service_cycles"] == 102
+
+
+def test_reduce_rejects_participant_outside_interconnect_atomically():
+    interconnect = _create_interconnect()
+    task = _create_reduce_task(
+        participants = [0, 4, 8, 16],
+        direction = None,
+    )
+    original_link_state = interconnect.link_busy_until_cycle.copy()
+
+    with pytest.raises(ValueError, match = "valid Interconnect chip ID"):
+        interconnect.reduce(task, request_cycle = 0)
+
+    assert interconnect.link_busy_until_cycle == original_link_state
+
+
+@pytest.mark.parametrize(
+    ("participants", "destination_chip", "direction", "expected_message"),
+    (
+        ([0, 1, 4], 0, "row", "same row"),
+        ([0, 4, 1], 0, "column", "same column"),
+        ([0, 4, 8, 12], 0, "all", "every Interconnect chip"),
+    ),
+)
+def test_reduce_rejects_direction_topology_mismatch_atomically(
+    participants,
+    destination_chip,
+    direction,
+    expected_message,
+):
+    interconnect = _create_interconnect()
+    task = _create_reduce_task(
+        participants = participants,
+        destination_chip = destination_chip,
+        direction = direction,
+    )
+    original_link_state = interconnect.link_busy_until_cycle.copy()
+
+    with pytest.raises(ValueError, match = expected_message):
+        interconnect.reduce(task, request_cycle = 0)
+
+    assert interconnect.link_busy_until_cycle == original_link_state
+
+
+def test_direct_reduce_rejects_missing_physical_link_without_multi_hop():
+    interconnect = _create_interconnect()
+    task = _create_reduce_task(
+        participants = [0, 5],
+        destination_chip = 0,
+        direction = None,
+    )
+    original_link_state = interconnect.link_busy_until_cycle.copy()
+
+    with pytest.raises(
+        NotImplementedError,
+        match = "direct Reduce requires a physical point-to-point link",
+    ):
+        interconnect.reduce(task, request_cycle = 0)
+
+    assert interconnect.link_busy_until_cycle == original_link_state
+
+
+def test_reduce_rejects_unsupported_algorithm_atomically():
+    collective_algorithms = COLLECTIVE_ALGORITHMS.copy()
+    collective_algorithms["reduce"] = "tree"
+    interconnect = _create_interconnect(
+        collective_algorithms = collective_algorithms,
+    )
+    original_link_state = interconnect.link_busy_until_cycle.copy()
+
+    with pytest.raises(NotImplementedError, match = "tree"):
+        interconnect.reduce(_create_reduce_task(), request_cycle = 0)
+
+    assert interconnect.link_busy_until_cycle == original_link_state
+
+
+def test_single_participant_reduce_is_no_op():
+    interconnect = _create_interconnect()
+    task = _create_reduce_task(
+        participants = [8],
+        destination_chip = 8,
+        direction = None,
+    )
+    original_link_state = interconnect.link_busy_until_cycle.copy()
+
+    result = interconnect.reduce(task, request_cycle = 123)
+
+    assert result["start_cycle"] == 123
+    assert result["finish_cycle"] == 123
+    assert result["wait_cycles"] == 0
+    assert result["service_cycles"] == 0
+    assert result["total_latency_cycles"] == 0
+    assert result["used_links"] == []
+    assert interconnect.link_busy_until_cycle == original_link_state
+
+
+def test_reduce_rejects_non_communication_task():
+    interconnect = _create_interconnect()
+    original_link_state = interconnect.link_busy_until_cycle.copy()
+
+    with pytest.raises(TypeError, match = "CommunicationTask"):
+        interconnect.reduce(object(), request_cycle = 0)
+
+    assert interconnect.link_busy_until_cycle == original_link_state
+
+
+def test_reduce_rejects_non_reduce_operation():
+    interconnect = _create_interconnect()
+    task = _create_communication_task()
+    original_link_state = interconnect.link_busy_until_cycle.copy()
+
+    with pytest.raises(ValueError, match = r"operation\(reduce\)"):
+        interconnect.reduce(task, request_cycle = 0)
+
+    assert interconnect.link_busy_until_cycle == original_link_state
+
+
+@pytest.mark.parametrize(
+    ("request_cycle", "expected_exception"),
+    (
+        (0.0, TypeError),
+        (True, TypeError),
+        (-1, ValueError),
+    ),
+)
+def test_reduce_rejects_invalid_request_cycle_atomically(
+    request_cycle,
+    expected_exception,
+):
+    interconnect = _create_interconnect()
+    original_link_state = interconnect.link_busy_until_cycle.copy()
+
+    with pytest.raises(expected_exception):
+        interconnect.reduce(_create_reduce_task(), request_cycle = request_cycle)
+
+    assert interconnect.link_busy_until_cycle == original_link_state

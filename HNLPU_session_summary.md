@@ -1,8 +1,8 @@
 # HNLPU 项目长会话上下文总结
 
 > 初次整理日期：2026-08-23
-> 最近同步日期：2026-08-28
-> 资料来源：指定 Codex JSONL 对话记录、对当前工作树的复核、2026-08-24 的两次 AttentionBuffer 增量提交，以及 2026-08-27 至 28 的 Interconnect 初始化与测试
+> 最近同步日期：2026-08-31
+> 资料来源：指定 Codex JSONL 对话记录、对当前工作树的复核、2026-08-24 的两次 AttentionBuffer 增量提交、2026-08-27 至 28 的 Interconnect 初始化，以及 2026-08-29 至 30 的 CommunicationTask 与 direct Reduce 实现和测试
 > 目的：为后续开发、汇报和新会话接续提供一份可独立阅读的项目上下文
 
 ## 1. 记录范围与结论摘要
@@ -20,15 +20,15 @@
 - 会话原始工作目录：/media/kai/Biggest Area/none/PhD/HNLPU-Long-Context
 - 会话开始时 Git 状态：master 分支，提交 5cca6146539d62c77dcf858dc0aa7df6634341ef
 
-虽然文件被保存在 2026/07/01 目录中，但它不是只有 7 月 1 日的一轮对话，而是一条持续到 8 月 22 日、围绕同一仓库不断演进的长会话。原记录中的绝对路径使用 /media/kai；初次整理和本次 Interconnect 同步使用 /media/zjk，AttentionBuffer 增量同步期间还曾使用 F:\none\PhD\HNLPU-Long-Context。本文因此主要使用仓库相对路径。
+虽然文件被保存在 2026/07/01 目录中，但它不是只有 7 月 1 日的一轮对话，而是一条持续到 8 月 22 日、围绕同一仓库不断演进的长会话。原记录中的绝对路径使用 /media/kai；后续整理使用过 /media/zjk 和 F:\none\PhD\HNLPU-Long-Context，当前工作树已移动到 /media/zjk/Biggest Area/none/PhD/Projects/HNLPU-Long-Context。本文因此主要使用仓库相对路径。
 
 项目主线可以概括为：
 
 1. 先建立“性能指标随上下文长度变化”的解析评估脚本。
 2. 随后将目标升级为不执行真实 Transformer 数值计算、但能够模拟容量、资源竞争和周期依赖的 HNLPU 性能模拟器。
 3. 逐步完成 Memory、Attention Buffer、HBM、KV Cache、Request、Config、Compute 和 Chip 的第一版。
-4. 通过单层、多层和长上下文三份单芯片集成测试、AttentionBuffer 定向测试和 Interconnect 定向测试，验证计算流程、KV 隔离、Attention Buffer 向 HBM 溢出、碎片化 allocation，以及 4×4 row/column topology 与物理 link 状态初始化。
-5. Interconnect 的构造、拓扑和动态 link busy state 已完成；具体通信操作与时延模型仍未实现。Pipeline、双缓冲、Trace Loader、System、多请求与完整多芯片执行也尚未完成。
+4. 通过单层、多层和长上下文三份单芯片集成测试、AttentionBuffer 定向测试和 Interconnect 定向测试，验证计算流程、KV 隔离、Attention Buffer 向 HBM 溢出、碎片化 allocation、4×4 topology、CommunicationTask 数据语义和 direct Reduce 的通信时序与链路竞争。
+5. Interconnect 已完成构造、拓扑、动态 link state、CommunicationTask 和 direct Reduce；broadcast、scatter、gather、all_reduce、all_gather、统一 execute、System、多请求与完整多芯片执行仍未完成。
 
 ## 2. 模拟器的最终定位
 
@@ -83,7 +83,7 @@ Chip
 └── HNArray
     └── HNUnit
 
-Interconnect                         拓扑与 link 状态初始化已完成；通信 timing 尚未完成
+Interconnect                         拓扑、CommunicationTask 与 direct Reduce 已完成
 System                               尚未完成
 ~~~
 
@@ -101,7 +101,8 @@ System                               尚未完成
 - HNArray：保存多个 HNUnit，并把线性任务路由到正确单元。
 - Chip：聚合本地存储、KV 管理和计算资源。
 - Pipeline：未来负责依赖调度、流水推进、HBM 双缓冲和访存/计算重叠。
-- Interconnect：只负责 Chip-to-Chip 通信；当前已建立 4×4 row/column fully-connected topology 和物理 link busy state，后续负责 collective timing 与链路竞争。
+- CommunicationTask：描述某个 Request 的通信操作、参与 Chip、单份数据大小、root 和 group direction，本身不执行通信或保存 timing。
+- Interconnect：只负责 Chip-to-Chip 通信；当前已建立 4×4 row/column topology、物理 link busy state 和 direct Reduce timing，后续继续扩展其他 collective。
 - System：未来负责多 Chip 聚合、跨模块协调和全局调度。
 
 最重要的边界是：Memory 不理解 request、layer、token 等 Transformer 语义；这些语义由 KVcacheBlock 和 KVcacheManager 管理。
@@ -119,6 +120,7 @@ System                               尚未完成
 | 8月17日至22日 | 计算模型细化 | 引入 HNUnit，重构 HNArray，扩展 ComputeTask/VEX，并迁移三份集成测试 |
 | 8月24日 | AttentionBuffer 分配修正 | 保留 balanced 优先路径，增加 single-group 与 multi-group fallback、统一 bank_groups record，并把 fallback 的 bank 内策略细化为 access-width circular round-robin |
 | 8月27日至28日 | Interconnect 初始化 | 完成参数校验、单位换算、4×4 row/column groups、48条无向物理 link 的 busy state、配置接入和18项定向测试；未实现具体通信 timing |
+| 8月29日至30日 | CommunicationTask 与 direct Reduce | 新增纯通信任务容器；实现 direct Reduce 的 topology/link 校验、并行 phase、链路竞争、原子状态更新和16项新增 timing case，完整测试增至85项 |
 
 ### 4.1 第一阶段：解析性能模型
 
@@ -586,7 +588,11 @@ _build_links() 依次遍历所有 row group 和 column group，只组合每组�
 
 每个 key 在 link_busy_until_cycle 中初始化为0。当前模拟抽象让两个通信方向共享同一条物理 link 的 busy state，尚不区分 full-duplex 的方向资源；如果以后需要独立方向状态，应在 timing model 设计阶段单独扩展。
 
-本轮没有实现 broadcast、reduce、scatter、gather、all_reduce 或 all_gather 的通信路径和成本公式。配置中的 direct 目前只是算法名称占位，不参与 timing。
+CommunicationTask 是纯数据容器，保存 request_id、operation、participants、data_size_byte、source_chip、destination_chip 和 direction。它严格校验六种 operation 的 root 语义，并复制 participants；但不选择算法、不验证具体 topology、不查询 link、不保存或计算 timing。algorithm 继续由 Interconnect.collective_algorithms 决定。
+
+Interconnect.reduce() 当前实现 direct Reduce：每个非 destination participant 通过一条直接物理 link 发送一份完整 partial result，canonical link key 仍为 `(min(src, dst), max(src, dst))`。所有 required links 先完整验证，再等待其中最晚的 busy_until_cycle，并在同一个 phase 中并行传输。单 link service 为 fixed link latency 加向上取整的 serialization cycles；成功后只更新实际使用的 links。单 participant 是0-cycle no-op。
+
+Reduce arithmetic latency 当前假设为0或与通信完全重叠；不同 direct links 并行、统一等待后启动、link 在 fixed latency 加 serialization 期间保持 busy，均属于 simulator abstraction，不是论文精确结论。当前不做 multi-hop，也没有实现 tree 等其他 Reduce 算法。broadcast、scatter、gather、all_reduce、all_gather 和统一 execute 仍未实现。
 
 ## 7. 发现并修复过的关键问题
 
@@ -827,11 +833,40 @@ git diff --check：通过
 
 仓库级 Ruff 仍有8.3节记录的5项既有问题，本次没有为通过全目录 lint 而修改无关模块。
 
-## 9. 当前文件状态（截至2026-08-28）
+### 8.6 2026-08-29 至 30 CommunicationTask 与 direct Reduce 测试
+
+CommunicationTask 阶段新增41个展开后的 pytest case，覆盖七个字段、participants copy、六种 operation 的严格 root 语义、非法类型/范围、direction，以及明确不保存 algorithm 或 timing。完成时：
+
+~~~text
+pytest -q hnlpu_sim_test/test_interconnect.py：59 passed
+pytest -q hnlpu_sim_test：69 passed
+~~~
+
+direct Reduce 阶段再新增16个展开后的 case，覆盖：
+
+- 4-chip column Reduce 的三条 canonical links 和101-cycle service；
+- required-link contention、无关 link 不阻塞，以及 serialization 向上取整；
+- participant 范围、row/column/all direction 一致性；
+- direct physical link 缺失时拒绝 multi-hop；
+- tree 等未实现算法；
+- single-participant no-op；
+- 非法 task、operation、request_cycle；
+- 所有异常路径保持 link state 不变。
+
+最终验证结果：
+
+~~~text
+pytest -q hnlpu_sim_test/test_interconnect.py：75 passed
+pytest -q hnlpu_sim_test：85 passed
+ruff check hnlpu_sim/interconnect.py hnlpu_sim_test/test_interconnect.py：通过
+git diff --check：通过
+~~~
+
+## 9. 当前文件状态（截至2026-08-31）
 
 | 文件或目录 | 状态 |
 |---|---|
-| [hnlpu_config.yaml](hnlpu_config.yaml) | 已有模型、硬件、VEX、存储、互连和评估配置；Interconnect 使用128 GB/s/link、作为 simulator assumption 的100 ns，以及六项 direct 算法占位 |
+| [hnlpu_config.yaml](hnlpu_config.yaml) | 已有模型、硬件、VEX、存储、互连和评估配置；Interconnect 使用128 GB/s/link、作为 simulator assumption 的100 ns，以及六项 direct 配置；当前只有 Reduce 消费其算法配置参与 timing |
 | [performance_eval_simplify_codex.py](simplified_eval/performance_eval_simplify_codex.py) | 简化上下文长度性能评估 |
 | [memory.py](hnlpu_sim/memory.py) | Memory、AttentionBuffer、HBM；AttentionBuffer 已支持三级分配、跨 group record、原子 plan/commit 和 access-width round-robin fallback |
 | [kv_cache.py](hnlpu_sim/kv_cache.py) | KVcacheBlock、KVcacheManager 第一版及内置测试 |
@@ -841,9 +876,9 @@ git diff --check：通过
 | [chip.py](hnlpu_sim/chip.py) | 单 Chip 资源聚合 |
 | [pipeline.py](hnlpu_sim/pipeline.py) | 只有骨架，尚无真实调度 |
 | [trace.py](hnlpu_sim/trace.py) | 尚未实现 |
-| [interconnect.py](hnlpu_sim/interconnect.py) | 已完成构造参数校验、单位换算、row/column groups 和无向 link busy state；通信操作与 timing 尚未实现 |
+| [interconnect.py](hnlpu_sim/interconnect.py) | 已完成 CommunicationTask、构造参数校验、单位换算、row/column groups、无向 link busy state 和 direct Reduce timing |
 | [system.py](hnlpu_sim/system.py) | 尚未实现系统逻辑 |
-| [hnlpu_sim_test](hnlpu_sim_test) | 三份单 Chip 集成测试、7项 AttentionBuffer 测试和18项 Interconnect 测试，当前共28项 pytest 通过 |
+| [hnlpu_sim_test](hnlpu_sim_test) | 三份单 Chip 集成测试、7项 AttentionBuffer 测试和75项 Interconnect 测试，当前共85项 pytest 通过 |
 | [hnlpu-sim-ubuntu24.04.yml](hnlpu-sim-ubuntu24.04.yml) | 面向 Ubuntu 24.04 的便携 Conda 环境 |
 | [hnlpu-sim-windows.yml](hnlpu-sim-windows.yml) | 当前 Windows 环境配置 |
 
@@ -883,7 +918,7 @@ Ubuntu 24.04 环境文件删除了原机器绝对 prefix、平台底层 Build �
 - HBM 6.4 TB/s；
 - HBM 100 ns；
 - Interconnect 当前采用100 ns 精确值；论文只报告 link latency 小于100 ns，因此该值是 simulator assumption；
-- collective_algorithms 当前全部写为 direct，但只是配置占位，不代表论文确认的通信算法或 timing；
+- collective_algorithms 当前全部写为 direct，不代表论文确认的算法；其中只有 Reduce 已有 simulator timing，其余 operation 仍只是配置占位；
 - HNArray 八类线性任务都为10 cycles；
 - VEX 向量操作固定周期；
 - Attention 使用 q_length × kv_length 的等价工作量；
@@ -907,7 +942,7 @@ Ubuntu 24.04 环境文件删除了原机器绝对 prefix、平台底层 Build �
 ### 10.5 其他限制
 
 - HBM 双缓冲或 staging buffer 未实现；
-- Interconnect 已完成 topology 和 link busy state 初始化，但 point-to-point/collective 路径、传输数据量、链路预约与竞争更新、具体通信时延均未实现；System 接入和完整 4×4 多芯片执行也尚未实现；
+- Interconnect 已完成 CommunicationTask 和 direct Reduce，但其他 collective、multi-hop、packet pipeline、full-duplex 方向独立状态、统一 execute、System 接入和完整 4×4 多芯片执行仍未实现；
 - KV 主动迁移、淘汰、换入换出和自动 Block 拆分未实现；
 - HBM 没有 Channel/Stack 级并发；
 - Attention Buffer allocation 已能跨 Bank group，容量账目层面的 group/Bank 碎片不再导致提前 spill；但模型仍不保存真实地址或连续区间，也没有物理碎片整理；
@@ -931,7 +966,7 @@ Ubuntu 24.04 环境文件删除了原机器绝对 prefix、平台底层 Build �
 4. 实现最小 Pipeline/Simulator：事件队列、任务依赖、资源预约和完成事件。
 5. 建立独立 DoubleBuffer/HBMStagingBuffer，由 Pipeline 模拟 HBM 加载与 VEX 计算重叠。
 6. 实现 KV Block 自动拆分、主动迁移和淘汰；如需提高物理精度，再引入真实地址、连续区间和地址级碎片模型。
-7. 在已有 Interconnect topology 与 link state 上，单独研究并实现 point-to-point/collective timing 和链路竞争，再接入16颗 Chip 与 System，验证 KV head、Token row 和 Expert 分布。
+7. 在已有 CommunicationTask 和 direct Reduce 上，继续研究并逐项实现 broadcast、scatter、gather、all_reduce、all_gather，再统一设计 execute；随后接入16颗 Chip 与 System，验证 KV head、Token row 和 Expert 分布。
 8. 实现 trace.py，支持真实 JSONL Trace 和合成长上下文负载。
 9. 增加多请求、Batch、跨 Chip、双缓冲、异常原子性和论文校准点回归测试。
 10. 将 hnlpu_sim 整理为正式 Python package，并把生产文件中的内置测试逐步迁移到独立测试目录。
@@ -1094,3 +1129,79 @@ Config 和 Interconnect 均校验 collective 字典的必需字段和值类型�
 18项定向测试和完整28项 pytest 均通过，覆盖拓扑、link、单位换算、配置集成、字典拷贝和非法参数。实际修改范围的 Ruff 与 git diff --check 通过；全仓库仍有5项与本轮无关的既有 Ruff 问题。
 
 本轮没有实现 all_reduce、all_gather、broadcast、reduce、scatter 或 gather，也没有为 direct、ring、tree 等名称加入 timing 公式。link_busy_until_cycle 目前只是已经初始化的动态状态容器，尚无通信方法更新它。下一阶段应先明确 collective 的参与 Chip group、通信步骤、每步数据量和 link 预约规则，再实现时延模型。
+
+## 16. 2026-08-29 至 31 增量同步：CommunicationTask 与 direct Reduce
+
+### 16.1 CommunicationTask 的职责与字段
+
+CommunicationTask 参考 ComputeTask 的风格实现为纯数据容器，最终字段为：
+
+- request_id：所属推理请求，必须非空且 hashable；
+- operation：broadcast、reduce、scatter、gather、all_reduce、all_gather 之一；
+- participants：参与通信的非负 Chip ID list，拒绝 bool、重复值和空 list，并复制保存；
+- data_size_byte：以 Byte 表示的正整数通信数据量；
+- source_chip、destination_chip：可选 root metadata，若提供则必须属于 participants；
+- direction：可选的 row、column 或 all group 描述。
+
+operation-specific 语义保持严格：broadcast/scatter 必须有 source 且没有 destination；reduce/gather 必须有 destination 且没有 source；all_reduce/all_gather 两者都必须为 None。CommunicationTask 不限制 Chip ID 小于16，也不判断 participants 是否真的属于某个 row/column/all group，这些 topology-specific check 留给 Interconnect。
+
+Task 中没有 algorithm 和 request/start/finish/wait/service/total latency 字段。它只描述“做什么”，具体“怎么做”由 Interconnect.collective_algorithms 决定，request_cycle 则由执行通信的方法单独接收。
+
+### 16.2 direct Reduce 的执行流程
+
+Interconnect.reduce(task, request_cycle) 依次完成：
+
+1. 校验 CommunicationTask 类型、reduce operation 和非负整数 request_cycle；
+2. 校验 participants 与 destination 是否属于当前 Interconnect 的 Chip ID 范围；
+3. 对 row/column direction 检查所有 participants 是否属于同一行/列，对 all 要求恰好包含全部 Chip；direction 为 None 时不做 group consistency check；
+4. 读取 collective_algorithms["reduce"]，当前只接受 direct；
+5. 为每个非 destination participant 构造 canonical physical link，并确认 link 实际存在；
+6. 所有校验完成后计算 phase timing，最后只更新 required links 并返回 timing dict。
+
+direct 的含义是每个 source 向 destination 直接发送一份完整 partial result。例如 participants 为 `[0, 4, 8, 12]`、destination 为8时，used_links 为：
+
+~~~text
+(0, 8)
+(4, 8)
+(8, 12)
+~~~
+
+若任意 source 与 destination 不同行且不同列，当前不会推导 multi-hop route，而是抛出 NotImplementedError。reduce algorithm 为 tree、ring 等未实现名称时也抛出 NotImplementedError。required links 会在任何状态修改之前完整确定，所以 validation、算法或 link 检查失败不会留下部分更新。
+
+### 16.3 Reduce timing 与链路竞争
+
+Reduce 中的 data_size_byte 表示每个 participant 上一份完整 partial result 的大小，不是 participant 数乘以该大小。单 link timing 为：
+
+~~~text
+bandwidth_byte_per_cycle = link_bandwidth_byte_per_s / clock_frequency_hz
+serialization_cycles = max(1, ceil(data_size_byte / bandwidth_byte_per_cycle))
+transfer_cycles = link_latency_cycles + serialization_cycles
+~~~
+
+当前128 GB/s、1 GHz 对应128 B/cycle；128-byte partial result 的 serialization 为1 cycle，加100-cycle fixed latency 后 service 为101 cycles。
+
+不同 source 到 destination 的独立 physical links 在同一个 phase 中并行，而不是累加时间。整个 phase 等所有 required links 都空闲后统一开始：
+
+~~~text
+phase_start_cycle = max(request_cycle, required links 的最晚 busy cycle)
+phase_finish_cycle = phase_start_cycle + transfer_cycles
+~~~
+
+随后所有 used_links 的 busy_until_cycle 统一更新为 phase_finish_cycle，无关 link 不受影响。若 participants 只有 destination，自然得到空 required_links，并在 request_cycle 原地完成，所有 timing 增量为0。
+
+### 16.4 当前 simulator assumptions
+
+以下均是当前模型抽象，不应表述成论文精确事实：
+
+- Reduce arithmetic latency 视为0或与通信完全重叠；
+- direct Reduce 的不同 physical links 可以并行；
+- 一个 phase 等待所有 required links 可用后统一开始；
+- link 在 fixed latency 加 serialization latency 的整个区间内保持 busy，尚无 packet pipeline；
+- canonical 无向 link 的两个方向共享同一个 busy_until_cycle，尚未建模 full-duplex 独立状态；
+- direct 缺少物理直连时不自动进行 multi-hop routing。
+
+### 16.5 修改范围、测试与当前边界
+
+两轮实现只修改 [interconnect.py](hnlpu_sim/interconnect.py) 和 [test_interconnect.py](hnlpu_sim_test/test_interconnect.py)。CommunicationTask 阶段只把 Interconnect.COLLECTIVE_OPERATIONS 接到共享 operation 常量，没有改变 Interconnect.__init__() 行为；Reduce 阶段没有改变 CommunicationTask.__init__() 或 Interconnect.__init__()。
+
+最终验证为75项 Interconnect 定向测试和85项完整 pytest 全部通过，修改范围 Ruff 与 git diff --check 通过。当前只有 direct Reduce 拥有通信 timing；broadcast、scatter、gather、all_reduce、all_gather 和统一 Interconnect.execute() 仍明确未实现。

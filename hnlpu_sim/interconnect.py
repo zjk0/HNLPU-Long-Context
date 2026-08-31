@@ -207,3 +207,152 @@ class Interconnect:
                         link_busy_until_cycle[link_key] = 0
 
         return link_busy_until_cycle
+
+    @staticmethod
+    def _get_link_key(source_chip, destination_chip):
+        return (min(source_chip, destination_chip), max(source_chip, destination_chip))
+
+    def _calculate_link_transfer_cycles(self, data_size_byte):
+        bandwidth_byte_per_cycle = self.link_bandwidth_byte_per_s / self.clock_frequency_hz
+        serialization_cycles = max(1, math.ceil(data_size_byte / bandwidth_byte_per_cycle))
+
+        # Simulator abstraction: a physical link remains busy throughout both
+        # its fixed latency and serialization latency; packet pipelining is not
+        # modeled yet.
+        return self.link_latency_cycles + serialization_cycles
+
+    def reduce(self, task: CommunicationTask, request_cycle):
+        if not isinstance(task, CommunicationTask):
+            raise TypeError("task must be a CommunicationTask.")
+        if task.operation != "reduce":
+            raise ValueError("Interconnect.reduce requires operation(reduce).")
+
+        if not isinstance(request_cycle, int) or isinstance(request_cycle, bool):
+            raise TypeError("request_cycle must be an integer.")
+        if request_cycle < 0:
+            raise ValueError("request_cycle must be greater than or equal to 0.")
+
+        if not isinstance(task.participants, list):
+            raise TypeError("task participants must be a list.")
+        if not task.participants:
+            raise ValueError("task participants must not be empty.")
+        for participant in task.participants:
+            if not isinstance(participant, int) or isinstance(participant, bool):
+                raise TypeError("Every task participant must be an integer.")
+            if not 0 <= participant < self.num_chips:
+                raise ValueError("Every task participant must be a valid Interconnect chip ID.")
+        if len(set(task.participants)) != len(task.participants):
+            raise ValueError("task participants must not contain duplicates.")
+
+        destination_chip = task.destination_chip
+        if destination_chip is None:
+            raise ValueError("A reduce task must provide destination_chip.")
+        if not isinstance(destination_chip, int) or isinstance(destination_chip, bool):
+            raise TypeError("task destination_chip must be an integer.")
+        if not 0 <= destination_chip < self.num_chips:
+            raise ValueError("task destination_chip must be a valid Interconnect chip ID.")
+        if destination_chip not in task.participants:
+            raise ValueError("task destination_chip must be present in participants.")
+        if task.source_chip is not None:
+            raise ValueError("A reduce task requires source_chip to be None.")
+
+        if not isinstance(task.data_size_byte, int) or isinstance(task.data_size_byte, bool):
+            raise TypeError("task data_size_byte must be an integer.")
+        if task.data_size_byte <= 0:
+            raise ValueError("task data_size_byte must be greater than 0.")
+
+        participant_set = set(task.participants)
+        if task.direction == "row":
+            participant_rows = {
+                chip_id // self.chip_grid_cols
+                for chip_id in task.participants
+            }
+            if len(participant_rows) != 1:
+                raise ValueError(
+                    "reduce participants must belong to the same row when "
+                    "direction is 'row'."
+                )
+        elif task.direction == "column":
+            participant_columns = {
+                chip_id % self.chip_grid_cols
+                for chip_id in task.participants
+            }
+            if len(participant_columns) != 1:
+                raise ValueError(
+                    "reduce participants must belong to the same column when "
+                    "direction is 'column'."
+                )
+        elif task.direction == "all":
+            if participant_set != set(range(self.num_chips)):
+                raise ValueError(
+                    "reduce participants must contain every Interconnect chip "
+                    "when direction is 'all'."
+                )
+        elif task.direction is not None:
+            raise ValueError(f"Unsupported communication direction({task.direction}).")
+
+        algorithm = self.collective_algorithms["reduce"]
+        if algorithm != "direct":
+            raise NotImplementedError(f"reduce algorithm({algorithm}) is not implemented.")
+
+        required_links = []
+        for source_chip in task.participants:
+            if source_chip == destination_chip:
+                continue
+
+            # Canonical undirected keys implement the current simulator
+            # abstraction in which both directions share one physical link
+            # busy state.
+            link_key = self._get_link_key(source_chip, destination_chip)
+            if link_key not in self.link_busy_until_cycle:
+                # Direct mode deliberately does not infer a multi-hop route.
+                raise NotImplementedError(
+                    "direct Reduce requires a physical point-to-point link "
+                    "from every non-destination participant to the destination; "
+                    f"no direct link exists from chip {source_chip} to chip "
+                    f"{destination_chip}."
+                )
+            required_links.append(link_key)
+
+        if not required_links:
+            phase_start_cycle = request_cycle
+            phase_finish_cycle = request_cycle
+        else:
+            # Simulator assumptions, not paper-specified timing facts: distinct
+            # physical links transfer in parallel, and one phase waits until
+            # every required link is available before all transfers start.
+            phase_start_cycle = max(
+                request_cycle,
+                max(
+                    self.link_busy_until_cycle[link]
+                    for link in required_links
+                ),
+            )
+
+            # data_size_byte is one complete partial result sent by each
+            # non-destination participant, rather than their aggregate size.
+            transfer_cycles = self._calculate_link_transfer_cycles(task.data_size_byte)
+            phase_finish_cycle = phase_start_cycle + transfer_cycles
+
+            # Simulator assumption: reduction arithmetic inside the
+            # Interconnect Engine is negligible or fully overlapped with the
+            # communication phase; no separate arithmetic latency is added.
+            for link in required_links:
+                self.link_busy_until_cycle[link] = phase_finish_cycle
+
+        return {
+            "request_id": task.request_id,
+            "operation": "reduce",
+            "algorithm": algorithm,
+            "participants": task.participants.copy(),
+            "destination_chip": destination_chip,
+            "direction": task.direction,
+            "data_size_byte": task.data_size_byte,
+            "request_cycle": request_cycle,
+            "start_cycle": phase_start_cycle,
+            "finish_cycle": phase_finish_cycle,
+            "wait_cycles": phase_start_cycle - request_cycle,
+            "service_cycles": phase_finish_cycle - phase_start_cycle,
+            "total_latency_cycles": phase_finish_cycle - request_cycle,
+            "used_links": required_links.copy(),
+        }
